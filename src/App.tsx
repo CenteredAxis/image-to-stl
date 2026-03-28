@@ -62,8 +62,8 @@ export default function App() {
         const img = new Image();
         img.onload = () => {
           const meshMax = settings.maxWidth;
-          const svgScale = 8;
-          const renderW = Math.min(8192, Math.max(meshMax * svgScale, img.width || 2048));
+          const svgScale = 4;
+          const renderW = Math.min(4096, Math.max(meshMax * svgScale, img.width || 2048));
           const renderH = img.height ? Math.round(renderW * (img.height / img.width)) : renderW;
           const srcCanvas = document.createElement('canvas');
           srcCanvas.width = renderW; srcCanvas.height = renderH;
@@ -124,39 +124,44 @@ export default function App() {
     if (!imgData) return;
     if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current);
     pipelineTimerRef.current = setTimeout(() => {
-      const isPick = settings.paletteMode === 'pick';
-      const result = runPipeline(
-        imgData,
-        settings.maxWidth,
-        settings.numColors,
-        settings.chamferWidth,
-        settings.removeBg,
-        settings.bgTolerance,
-        settings.smoothing,
-        settings.minRegion,
-        isPick,
-        manualPalette,
-        hasAlpha,
-        fileIsPng
-      );
-      setPipelineResult({
-        colorIndex: result.colorIndex,
-        palette: result.palette,
-        dist: result.dist,
-        BG_INDEX: result.BG_INDEX,
-        tw: result.tw,
-        th: result.th,
-      });
-      if (result.bgMask) {
-        let bgCount = 0;
-        for (let i = 0; i < result.bgMask.length; i++) if (result.bgMask[i]) bgCount++;
-        setBgPercent((bgCount / result.bgMask.length) * 100);
-      } else {
-        setBgPercent(0);
+      try {
+        const isPick = settings.paletteMode === 'pick';
+        const result = runPipeline(
+          imgData,
+          settings.maxWidth,
+          settings.numColors,
+          settings.chamferWidth,
+          settings.removeBg,
+          settings.bgTolerance,
+          settings.smoothing,
+          settings.minRegion,
+          isPick,
+          manualPalette,
+          hasAlpha,
+          fileIsPng
+        );
+        setPipelineResult({
+          colorIndex: result.colorIndex,
+          palette: result.palette,
+          dist: result.dist,
+          BG_INDEX: result.BG_INDEX,
+          tw: result.tw,
+          th: result.th,
+        });
+        if (result.bgMask) {
+          let bgCount = 0;
+          for (let i = 0; i < result.bgMask.length; i++) if (result.bgMask[i]) bgCount++;
+          setBgPercent((bgCount / result.bgMask.length) * 100);
+        } else {
+          setBgPercent(0);
+        }
+      } catch (e: unknown) {
+        setStatus(`Pipeline error: ${(e as Error).message}`, 'error');
+        console.error('Pipeline error:', e);
       }
     }, 150);
     return () => { if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current); };
-  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng]);
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus]);
 
   // ── Color pick ───────────────────────────────────────────────────────────────
   const handleColorPick = useCallback((r: number, g: number, b: number) => {

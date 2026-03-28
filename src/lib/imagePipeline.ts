@@ -13,7 +13,7 @@ export function computeBgMask(
   const count = targetW * targetH;
   const mask = new Uint8Array(count);
 
-  if (hasAlpha && fileIsPng) {
+  if (hasAlpha) {
     for (let y = 0; y < targetH; y++) {
       for (let x = 0; x < targetW; x++) {
         const sx = Math.round((x / (targetW - 1)) * (sw - 1));
