@@ -1,0 +1,320 @@
+import { useState, useCallback, useEffect, useRef } from 'react';
+import type { RGB, PipelineResult, MeshResult, ZoomLensInfo, StatusState } from './types';
+import { useSettings } from './hooks/useSettings';
+import { parseSvgColors, consolidateSvgColors } from './lib/svgParser';
+import { runPipeline } from './lib/imagePipeline';
+import { generateSTLWithMeshData, generatePerColorSTLs } from './lib/meshBuilder';
+import { buildZip } from './lib/zip';
+import { DropZone } from './components/DropZone';
+import { SourceImageCanvas } from './components/SourceImageCanvas';
+import { BoundaryCanvas } from './components/BoundaryCanvas';
+import { ColorSwatches } from './components/ColorSwatches';
+import { FilamentSection } from './components/FilamentSection';
+import { SettingsPanel } from './components/SettingsPanel';
+import { Preview3D } from './components/Preview3D';
+import { ZoomLens } from './components/ZoomLens';
+import { StatusBar } from './components/StatusBar';
+
+export default function App() {
+  const { settings, updateSetting } = useSettings();
+
+  const [imgData, setImgData] = useState<ImageData | null>(null);
+  const [fileName, setFileName] = useState('model');
+  const [fileIsPng, setFileIsPng] = useState(false);
+  const [fileIsSvg, setFileIsSvg] = useState(false);
+  const [hasAlpha, setHasAlpha] = useState(false);
+  const [manualPalette, setManualPalette] = useState<RGB[]>([]);
+
+  const [pipelineResult, setPipelineResult] = useState<PipelineResult | null>(null);
+  const [bgPercent, setBgPercent] = useState(0);
+  const [meshResult, setMeshResult] = useState<MeshResult | null>(null);
+  const [stlBlob, setStlBlob] = useState<Blob | null>(null);
+
+  const [status, setStatusState] = useState<StatusState>({ message: '', variant: '' });
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [zoomLens, setZoomLens] = useState<ZoomLensInfo>({
+    visible: false, screenX: 0, screenY: 0, colorLabel: '', borderColor: '#4a9eff', drawFn: null
+  });
+
+  const setStatus = useCallback((message: string, variant: StatusState['variant']) => {
+    setStatusState({ message, variant });
+  }, []);
+
+  // ── Load image ───────────────────────────────────────────────────────────────
+  const handleFile = useCallback((file: File) => {
+    const baseName = file.name.replace(/\.[^.]+$/, '');
+    const isPng = file.type === 'image/png' || /\.png$/i.test(file.name);
+    const isSvg = file.type === 'image/svg+xml' || /\.svg$/i.test(file.name);
+
+    setFileName(baseName);
+    setFileIsPng(isPng);
+    setFileIsSvg(isSvg);
+    setManualPalette([]);
+    setMeshResult(null);
+    setStlBlob(null);
+
+    if (isSvg) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const svgText = e.target!.result as string;
+        const svgColors = parseSvgColors(svgText);
+
+        const img = new Image();
+        img.onload = () => {
+          const meshMax = settings.maxWidth;
+          const svgScale = 8;
+          const renderW = Math.min(8192, Math.max(meshMax * svgScale, img.width || 2048));
+          const renderH = img.height ? Math.round(renderW * (img.height / img.width)) : renderW;
+          const srcCanvas = document.createElement('canvas');
+          srcCanvas.width = renderW; srcCanvas.height = renderH;
+          const ctx = srcCanvas.getContext('2d')!;
+          ctx.clearRect(0, 0, renderW, renderH);
+          ctx.drawImage(img, 0, 0, renderW, renderH);
+          const data = ctx.getImageData(0, 0, renderW, renderH);
+
+          const { palette: dominant, snappedCount } = consolidateSvgColors(svgColors, data);
+          setImgData(data);
+          setHasAlpha(true);
+          setManualPalette(dominant.map(c => [c[0], c[1], c[2]]));
+          updateSetting('paletteMode', 'pick');
+
+          const snapMsg = snappedCount > 0 ? ` — ${snappedCount} artifact colors auto-snapped` : '';
+          setStatus(`SVG loaded: ${renderW}×${renderH} — ${dominant.length} dominant colors${snapMsg}`, '');
+        };
+        const svgBlob = new Blob([svgText], { type: 'image/svg+xml' });
+        img.src = URL.createObjectURL(svgBlob);
+      };
+      reader.readAsText(file);
+      return;
+    }
+
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 2048;
+      let w = img.width, h = img.height;
+      if (w > maxDim || h > maxDim) {
+        const s = maxDim / Math.max(w, h);
+        w = Math.round(w * s); h = Math.round(h * s);
+      }
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = w; srcCanvas.height = h;
+      const ctx = srcCanvas.getContext('2d')!;
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      const data = ctx.getImageData(0, 0, w, h);
+
+      let alpha = false;
+      if (isPng) {
+        for (let i = 3; i < data.data.length; i += 4) {
+          if (data.data[i] < 240) { alpha = true; break; }
+        }
+      }
+      setImgData(data);
+      setHasAlpha(alpha);
+      const alphaNote = alpha ? ' (has alpha)' : isPng ? ' (PNG, no alpha)' : '';
+      setStatus(`Image loaded: ${img.width}×${img.height}${alphaNote}`, '');
+    };
+    img.src = URL.createObjectURL(file);
+  }, [settings.maxWidth, updateSetting, setStatus]);
+
+  // ── Pipeline (debounced) ─────────────────────────────────────────────────────
+  const pipelineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!imgData) return;
+    if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current);
+    pipelineTimerRef.current = setTimeout(() => {
+      const isPick = settings.paletteMode === 'pick';
+      const result = runPipeline(
+        imgData,
+        settings.maxWidth,
+        settings.numColors,
+        settings.chamferWidth,
+        settings.removeBg,
+        settings.bgTolerance,
+        settings.smoothing,
+        settings.minRegion,
+        isPick,
+        manualPalette,
+        hasAlpha,
+        fileIsPng
+      );
+      setPipelineResult({
+        colorIndex: result.colorIndex,
+        palette: result.palette,
+        dist: result.dist,
+        BG_INDEX: result.BG_INDEX,
+        tw: result.tw,
+        th: result.th,
+      });
+      if (result.bgMask) {
+        let bgCount = 0;
+        for (let i = 0; i < result.bgMask.length; i++) if (result.bgMask[i]) bgCount++;
+        setBgPercent((bgCount / result.bgMask.length) * 100);
+      } else {
+        setBgPercent(0);
+      }
+    }, 150);
+    return () => { if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current); };
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng]);
+
+  // ── Color pick ───────────────────────────────────────────────────────────────
+  const handleColorPick = useCallback((r: number, g: number, b: number) => {
+    const isDup = manualPalette.some(c => {
+      const dr = c[0] - r, dg = c[1] - g, db = c[2] - b;
+      return dr * dr + dg * dg + db * db < 900;
+    });
+    if (!isDup) setManualPalette(prev => [...prev, [r, g, b]]);
+  }, [manualPalette]);
+
+  const handleRemovePalette = useCallback((i: number) => {
+    setManualPalette(prev => prev.filter((_, idx) => idx !== i));
+  }, []);
+
+  // ── Generate ─────────────────────────────────────────────────────────────────
+  const handleGenerate = useCallback(() => {
+    if (!imgData) return;
+    setIsGenerating(true);
+    setStatus('Generating mesh...', 'working');
+    setTimeout(() => {
+      try {
+        const result = generateSTLWithMeshData(imgData, settings, manualPalette, hasAlpha, fileIsPng);
+        setStlBlob(result.blob);
+        setMeshResult(result);
+        const sizeMB = (result.blob.size / (1024 * 1024)).toFixed(2);
+        setStatus(`Done! ${sizeMB} MB, ${(result.triCount / 1000).toFixed(1)}K triangles`, 'done');
+      } catch (e: unknown) {
+        setStatus(`Error: ${(e as Error).message}`, 'error');
+        console.error(e);
+      }
+      setIsGenerating(false);
+    }, 50);
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus]);
+
+  const handleDownloadSingle = useCallback(() => {
+    if (!stlBlob) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(stlBlob);
+    a.download = `${fileName}.stl`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, [stlBlob, fileName]);
+
+  const handleDownloadBambu = useCallback(() => {
+    if (!imgData) return;
+    setStatus('Generating per-color STLs...', 'working');
+    setTimeout(() => {
+      try {
+        const files = generatePerColorSTLs(imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName);
+        const zip = buildZip(files);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(zip);
+        a.download = `${fileName}_bambu.zip`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        setStatus(`Done! ${files.length} color STLs zipped.`, 'done');
+      } catch (e: unknown) {
+        setStatus(`Error: ${(e as Error).message}`, 'error');
+        console.error(e);
+      }
+    }, 50);
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName, setStatus]);
+
+  const hideZoom = useCallback(() => {
+    setZoomLens(prev => ({ ...prev, visible: false, drawFn: null }));
+  }, []);
+
+  const isPick = settings.paletteMode === 'pick';
+  const displayPalette = isPick ? manualPalette : (pipelineResult?.palette ?? []);
+  const aspectRatio = imgData ? imgData.height / imgData.width : 0;
+
+  return (
+    <div className="container">
+      <h1>Image to STL</h1>
+      <p className="subtitle">Flat color regions separated by chamfered grooves</p>
+
+      <DropZone onFile={handleFile} />
+
+      {imgData && (
+        <div className="preview-row">
+          <div className="preview-box">
+            <h3>Source Image</h3>
+            <SourceImageCanvas
+              imgData={imgData}
+              isPick={isPick}
+              onColorPick={handleColorPick}
+              onZoom={setZoomLens}
+              onZoomHide={hideZoom}
+            />
+            {isPick && (
+              <p className="pick-hint">Click on the image to pick colors. Click a swatch to remove it.</p>
+            )}
+          </div>
+
+          <div className="preview-box">
+            <h3>Quantized Colors &amp; Boundaries</h3>
+            <BoundaryCanvas
+              result={pipelineResult}
+              highlightSmall={settings.highlightSmall}
+              onZoom={setZoomLens}
+              onZoomHide={hideZoom}
+            />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: '0.8rem', color: '#aaa', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.highlightSmall}
+                onChange={e => updateSetting('highlightSmall', e.target.checked)}
+              />
+              Highlight non-contiguous regions
+            </label>
+            <ColorSwatches
+              palette={displayPalette}
+              isPick={isPick}
+              bgPercent={bgPercent}
+              onRemove={handleRemovePalette}
+            />
+          </div>
+        </div>
+      )}
+
+      <FilamentSection palette={displayPalette} />
+
+      <SettingsPanel
+        settings={settings}
+        onChange={updateSetting}
+        hasImage={!!imgData}
+        aspectRatio={aspectRatio}
+      />
+
+      <Preview3D result={meshResult} />
+
+      <div className="btn-row">
+        <button
+          className="btn-primary"
+          disabled={!imgData || isGenerating}
+          onClick={handleGenerate}
+        >
+          Generate &amp; Preview 3D
+        </button>
+        <button
+          className="btn-secondary"
+          disabled={!stlBlob || isGenerating}
+          onClick={handleDownloadSingle}
+        >
+          Download STL (single)
+        </button>
+        <button
+          className="btn-secondary"
+          disabled={!imgData || isGenerating}
+          onClick={handleDownloadBambu}
+        >
+          Download for Bambu (per-color STLs)
+        </button>
+      </div>
+
+      <StatusBar status={status} />
+
+      <ZoomLens info={zoomLens} />
+    </div>
+  );
+}
