@@ -21,6 +21,8 @@ export function SourceImageCanvas({ imgData, isPick, onColorPick, onZoom, onZoom
     canvas.width = imgData.width;
     canvas.height = imgData.height;
     const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.putImageData(imgData, 0, 0);
   }, [imgData]);
 
