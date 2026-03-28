@@ -1,0 +1,7 @@
+services:
+  image-to-stl:
+    image: ghcr.io/centeredaxis/image-to-stl:latest
+    container_name: image-to-stl
+    ports:
+      - "8080:80"
+    restart: unless-stopped
