@@ -509,6 +509,8 @@ export function erodeThinStrips(
   h: number,
   BG_INDEX: number
 ): void {
+  const votes = new Uint16Array(256);
+  const touched: number[] = [];
   for (let pass = 0; pass < 2; pass++) {
     let changed = false;
     const next = new Uint8Array(colorIndex);
@@ -523,7 +525,7 @@ export function erodeThinStrips(
         const d = y < h - 1 && colorIndex[idx + w] === c;
         const sameCount = (l ? 1 : 0) + (r ? 1 : 0) + (u ? 1 : 0) + (d ? 1 : 0);
         if (sameCount >= 2) continue;
-        const votes = new Uint16Array(256);
+        touched.length = 0;
         let bestC = c, bestV = 0;
         for (let dy = -1; dy <= 1; dy++) {
           for (let dx = -1; dx <= 1; dx++) {
@@ -532,11 +534,13 @@ export function erodeThinStrips(
             if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
             const nc = colorIndex[ny * w + nx];
             if (nc !== c && nc !== BG_INDEX) {
+              if (votes[nc] === 0) touched.push(nc);
               votes[nc]++;
               if (votes[nc] > bestV) { bestV = votes[nc]; bestC = nc; }
             }
           }
         }
+        for (const nc of touched) votes[nc] = 0;
         if (bestC !== c) { next[idx] = bestC; changed = true; }
       }
     }

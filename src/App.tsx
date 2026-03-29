@@ -62,8 +62,8 @@ export default function App() {
         const img = new Image();
         img.onload = () => {
           const meshMax = settings.maxWidth;
-          const svgScale = 4;
-          const renderW = Math.min(4096, Math.max(meshMax * svgScale, img.width || 2048));
+          // 2x oversample is enough for majority-voting in quantizeColors (scaleX >= 2)
+          const renderW = Math.min(2048, Math.max(meshMax * 2, img.width || meshMax * 2));
           const renderH = img.height ? Math.round(renderW * (img.height / img.width)) : renderW;
           const srcCanvas = document.createElement('canvas');
           srcCanvas.width = renderW; srcCanvas.height = renderH;
@@ -72,7 +72,15 @@ export default function App() {
           ctx.drawImage(img, 0, 0, renderW, renderH);
           const data = ctx.getImageData(0, 0, renderW, renderH);
 
-          const { palette: dominant, snappedCount } = consolidateSvgColors(svgColors, data);
+          // Downsample to ~512px for color counting — full-res isn't needed here
+          const countW = Math.min(512, renderW);
+          const countH = Math.round(countW * renderH / renderW);
+          const countCanvas = document.createElement('canvas');
+          countCanvas.width = countW; countCanvas.height = countH;
+          countCanvas.getContext('2d')!.drawImage(srcCanvas, 0, 0, countW, countH);
+          const countData = countCanvas.getContext('2d')!.getImageData(0, 0, countW, countH);
+
+          const { palette: dominant, snappedCount } = consolidateSvgColors(svgColors, countData);
           setImgData(data);
           setHasAlpha(true);
           setManualPalette(dominant.map(c => [c[0], c[1], c[2]]));
