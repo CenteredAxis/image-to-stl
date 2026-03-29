@@ -57,7 +57,15 @@ export function Preview3D({ result }: Props) {
 
     for (let t = 0; t < triCount; t++) {
       const i = t * 9;
-      for (let j = 0; j < 9; j++) positions[i + j] = tris[i + j];
+      // Copy A unchanged; swap B and C when mirrorX to restore correct winding
+      // (mirroring X reverses winding, same correction the STL exporter applies)
+      positions[i]     = tris[i];     positions[i + 1] = tris[i + 1]; positions[i + 2] = tris[i + 2];
+      if (mirrorX) {
+        positions[i + 3] = tris[i + 6]; positions[i + 4] = tris[i + 7]; positions[i + 5] = tris[i + 8];
+        positions[i + 6] = tris[i + 3]; positions[i + 7] = tris[i + 4]; positions[i + 8] = tris[i + 5];
+      } else {
+        for (let j = 3; j < 9; j++) positions[i + j] = tris[i + j];
+      }
       const cx = (tris[i] + tris[i + 3] + tris[i + 6]) / 3;
       const cy = (tris[i + 1] + tris[i + 4] + tris[i + 7]) / 3;
       // When mirrorX, vertex X = modelW - col*dx, so col = (modelW - cx) / dx
