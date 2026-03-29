@@ -21,7 +21,7 @@ export function BoundaryCanvas({ result, highlightSmall, onZoom, onZoomHide }: P
     const canvas = canvasRef.current;
     canvas.width = tw;
     canvas.height = th;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const out = ctx.createImageData(tw, th);
 
     // Determine effective chamferW from dist range
