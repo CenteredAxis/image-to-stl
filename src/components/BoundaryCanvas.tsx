@@ -17,7 +17,6 @@ export function BoundaryCanvas({ result, highlightSmall, onZoom, onZoomHide }: P
   useEffect(() => {
     if (!result || !canvasRef.current) return;
     const { colorIndex, palette, dist, BG_INDEX, tw, th } = result;
-    const chamferW = Math.max(...dist.filter(d => d < 9999)) || 3;
 
     const canvas = canvasRef.current;
     canvas.width = tw;
