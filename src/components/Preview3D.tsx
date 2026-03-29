@@ -49,7 +49,7 @@ export function Preview3D({ result }: Props) {
     controls.dampingFactor = 0.1;
     controls.update();
 
-    const { tris, colorIndex, palette, BG_INDEX, gw, gh, dx, dy } = result;
+    const { tris, colorIndex, palette, BG_INDEX, gw, gh, modelW, dx, dy, mirrorX } = result;
     const triCount = tris.length / 9;
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(tris.length);
@@ -60,7 +60,9 @@ export function Preview3D({ result }: Props) {
       for (let j = 0; j < 9; j++) positions[i + j] = tris[i + j];
       const cx = (tris[i] + tris[i + 3] + tris[i + 6]) / 3;
       const cy = (tris[i + 1] + tris[i + 4] + tris[i + 7]) / 3;
-      const gx = Math.min(gw - 1, Math.max(0, Math.round(cx / dx)));
+      // When mirrorX, vertex X = modelW - col*dx, so col = (modelW - cx) / dx
+      const rawCx = mirrorX ? (modelW - cx) : cx;
+      const gx = Math.min(gw - 1, Math.max(0, Math.round(rawCx / dx)));
       const gy = Math.min(gh - 1, Math.max(0, Math.round(cy / dy)));
       const ci = colorIndex[gy * gw + gx];
       let r = 0.15, g = 0.15, b = 0.15;

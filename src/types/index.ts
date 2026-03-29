@@ -31,6 +31,7 @@ export interface MeshResult {
   heights: Float32Array;
   dx: number;
   dy: number;
+  mirrorX: boolean;
 }
 
 export interface Settings {

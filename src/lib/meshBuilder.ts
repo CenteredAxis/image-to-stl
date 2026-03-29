@@ -240,7 +240,7 @@ export function generateSTLWithMeshData(
   }
 
   const blob = new Blob([buf], { type: 'application/octet-stream' });
-  return { blob, triCount: totalTris, tris, colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, dx, dy };
+  return { blob, triCount: totalTris, tris, colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, dx, dy, mirrorX };
 }
 
 export function generatePerColorSTLs(
