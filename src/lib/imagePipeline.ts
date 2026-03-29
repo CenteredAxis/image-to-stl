@@ -117,15 +117,18 @@ export function quantizeColors(
   const scaleX = sw / targetW, scaleY = sh / targetH;
   const useMajorityVoting = !!(forcePalette && forcePalette.length > 0 && scaleX >= 2);
   const BG_INDEX = 255;
+  // Allocate once, reuse per cell (avoids 1M+ GC-heavy allocations in the inner loop)
+  const mvVotes = forcePalette ? new Uint32Array(forcePalette.length) : null;
 
   for (let y = 0; y < targetH; y++) {
     const sy0 = Math.floor(y * scaleY), sy1 = Math.min(sh - 1, Math.floor((y + 1) * scaleY));
     for (let x = 0; x < targetW; x++) {
       const sx0 = Math.floor(x * scaleX), sx1 = Math.min(sw - 1, Math.floor((x + 1) * scaleX));
 
-      if (useMajorityVoting && forcePalette) {
+      if (useMajorityVoting && forcePalette && mvVotes) {
         const AA_THRESH = 80 * 80 + 80 * 80 + 80 * 80;
-        const votes = new Uint32Array(forcePalette.length);
+        mvVotes.fill(0);
+        const votes = mvVotes;
         let totalAlpha = 0;
         for (let sy = sy0; sy <= sy1; sy++) {
           for (let sx = sx0; sx <= sx1; sx++) {
