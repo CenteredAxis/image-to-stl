@@ -49,6 +49,7 @@ export interface Settings {
   cutThrough: boolean;
   hollow: boolean;
   mirrorX: boolean;
+  faceDown: boolean;
   highlightSmall: boolean;
   paletteMode: 'pick' | 'auto';
 }

@@ -41,7 +41,7 @@ function Checkbox({ id, label, checked, onChange }: {
 export function SettingsPanel({ settings, onChange, hasImage, aspectRatio }: Props) {
   const { maxWidth, numColors, surfaceHeight, baseHeight, chamferDepth, chamferWidth,
     smoothing, minRegion, modelWidth, bgTolerance, removeBg, cutThrough, hollow,
-    mirrorX, paletteMode } = settings;
+    mirrorX, faceDown, paletteMode } = settings;
 
   const sizeEstimate = () => {
     if (!hasImage || aspectRatio <= 0) return null;
@@ -109,7 +109,8 @@ export function SettingsPanel({ settings, onChange, hasImage, aspectRatio }: Pro
           <Checkbox id="removeBg" label="Remove background" checked={removeBg} onChange={v => onChange('removeBg', v)} />
           <Checkbox id="cutThrough" label="Cut through base (no floor under BG)" checked={cutThrough} onChange={v => onChange('cutThrough', v)} />
           <Checkbox id="hollow" label="Hollow base (save material)" checked={hollow} onChange={v => onChange('hollow', v)} />
-          <Checkbox id="mirrorX" label="Mirror X (for face-down printing)" checked={mirrorX} onChange={v => onChange('mirrorX', v)} />
+          <Checkbox id="mirrorX" label="Mirror X (flip left-right)" checked={mirrorX} onChange={v => onChange('mirrorX', v)} />
+          <Checkbox id="faceDown" label="Print face-down (chamfer on bed side — best surface quality)" checked={faceDown} onChange={v => onChange('faceDown', v)} />
         </div>
       </div>
     </div>

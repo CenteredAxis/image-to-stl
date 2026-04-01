@@ -16,7 +16,7 @@ export function generateSTLWithMeshData(
     maxWidth, numColors, surfaceHeight: surfaceH, baseHeight: baseH,
     chamferDepth: chamferD, chamferWidth: chamferW, modelWidth: modelW,
     hollow, removeBg, cutThrough, bgTolerance: bgTol,
-    smoothing: smoothSigma, minRegion, paletteMode, mirrorX
+    smoothing: smoothSigma, minRegion, paletteMode, mirrorX, faceDown
   } = settings;
   const isPick = paletteMode === 'pick';
 
@@ -210,16 +210,22 @@ export function generateSTLWithMeshData(
   for (let i = 0; i < 80; i++) view.setUint8(i, i < header.length ? header.charCodeAt(i) : 0);
   view.setUint32(80, totalTris, true);
 
+  // faceDown flips Z so the chamfered face presses against the bed (best surface quality).
+  // Z-flip reverses winding; X-mirror also reverses winding — they cancel when both active.
+  const totalH = baseH + surfaceH;
+  const doWindingSwap = mirrorX !== faceDown;
+
   let offset = 84;
   for (let t = 0; t < tris.length; t += 9) {
     let ax=tris[t],ay=tris[t+1],az=tris[t+2];
-    let bx: number, by: number, bz: number, cx: number, cy: number, cz: number;
-    if (mirrorX) {
-      bx=tris[t+6];by=tris[t+7];bz=tris[t+8];
-      cx=tris[t+3];cy=tris[t+4];cz=tris[t+5];
-    } else {
-      bx=tris[t+3];by=tris[t+4];bz=tris[t+5];
-      cx=tris[t+6];cy=tris[t+7];cz=tris[t+8];
+    let bx=tris[t+3],by=tris[t+4],bz=tris[t+5];
+    let cx=tris[t+6],cy=tris[t+7],cz=tris[t+8];
+    if (faceDown) { az=totalH-az; bz=totalH-bz; cz=totalH-cz; }
+    if (doWindingSwap) {
+      let tmp: number;
+      tmp=bx; bx=cx; cx=tmp;
+      tmp=by; by=cy; cy=tmp;
+      tmp=bz; bz=cz; cz=tmp;
     }
     const ux=bx-ax,uy=by-ay,uz=bz-az, wx=cx-ax,wy=cy-ay,wz=cz-az;
     let nx=uy*wz-uz*wy, ny=uz*wx-ux*wz, nz=ux*wy-uy*wx;
@@ -255,7 +261,7 @@ export function generatePerColorSTLs(
     maxWidth, numColors, surfaceHeight: surfaceH, baseHeight: baseH,
     chamferDepth: chamferD, chamferWidth: chamferW, modelWidth: modelW,
     removeBg, bgTolerance: bgTol, smoothing: smoothSigma,
-    minRegion, paletteMode, mirrorX
+    minRegion, paletteMode, mirrorX, faceDown
   } = settings;
   const isPick = paletteMode === 'pick';
 
@@ -363,6 +369,11 @@ export function generatePerColorSTLs(
 
     let offset = 84;
 
+    // faceDown flips Z so chamfered face presses against the print bed.
+    // Z-flip reverses winding; X-mirror also reverses winding — they cancel when both active.
+    const totalH = baseH + surfaceH;
+    const doWindingSwap = mirrorX !== faceDown;
+
     const writeTri = (nx: number, ny: number, nz: number, ax: number, ay: number, az: number,
                       bx: number, by: number, bz: number, cx: number, cy: number, cz: number) => {
       view.setFloat32(offset, nx, true); offset += 4;
@@ -382,8 +393,9 @@ export function generatePerColorSTLs(
 
     const addTri = (ax: number, ay: number, az: number, bx: number, by: number, bz: number,
                     cx: number, cy: number, cz: number) => {
+      if (faceDown) { az=totalH-az; bz=totalH-bz; cz=totalH-cz; }
       let rbx = bx, rby = by, rbz = bz, rcx = cx, rcy = cy, rcz = cz;
-      if (mirrorX) { rbx = cx; rby = cy; rbz = cz; rcx = bx; rcy = by; rcz = bz; }
+      if (doWindingSwap) { rbx = cx; rby = cy; rbz = cz; rcx = bx; rcy = by; rcz = bz; }
       const ux=rbx-ax,uy=rby-ay,uz=rbz-az,vx=rcx-ax,vy=rcy-ay,vz=rcz-az;
       let nnx=uy*vz-uz*vy, nny=uz*vx-ux*vz, nnz=ux*vy-uy*vx;
       const len=Math.sqrt(nnx*nnx+nny*nny+nnz*nnz)||1;

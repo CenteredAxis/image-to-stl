@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS: Settings = {
   cutThrough: false,
   hollow: false,
   mirrorX: false,
+  faceDown: false,
   highlightSmall: true,
   paletteMode: 'pick',
 };
