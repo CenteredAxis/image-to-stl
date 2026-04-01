@@ -20,7 +20,7 @@ export interface PipelineResult {
 export interface MeshResult {
   blob: Blob;
   triCount: number;
-  tris: number[];
+  tris: Float32Array;
   colorIndex: Uint8Array;
   palette: RGB[];
   BG_INDEX: number;

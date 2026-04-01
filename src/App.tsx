@@ -1,10 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { RGB, PipelineResult, MeshResult, ZoomLensInfo, StatusState } from './types';
 import { useSettings } from './hooks/useSettings';
+import { useWorker } from './hooks/useWorker';
 import { parseSvgColors, consolidateSvgColors } from './lib/svgParser';
-import { runPipeline } from './lib/imagePipeline';
-import { generateSTLWithMeshData, generatePerColorSTLs } from './lib/meshBuilder';
-import { buildZip } from './lib/zip';
 import { DropZone } from './components/DropZone';
 import { SourceImageCanvas } from './components/SourceImageCanvas';
 import { BoundaryCanvas } from './components/BoundaryCanvas';
@@ -17,6 +15,7 @@ import { StatusBar } from './components/StatusBar';
 
 export default function App() {
   const { settings, updateSetting } = useSettings();
+  const post = useWorker();
 
   const [imgData, setImgData] = useState<ImageData | null>(null);
   const [fileName, setFileName] = useState('model');
@@ -125,51 +124,40 @@ export default function App() {
     img.src = URL.createObjectURL(file);
   }, [settings.maxWidth, updateSetting, setStatus]);
 
-  // ── Pipeline (debounced) ─────────────────────────────────────────────────────
+  // ── Pipeline (debounced, runs in worker) ─────────────────────────────────────
   const pipelineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pipelineSeqRef = useRef(0);
 
   useEffect(() => {
     if (!imgData) return;
     if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current);
-    pipelineTimerRef.current = setTimeout(() => {
+    pipelineTimerRef.current = setTimeout(async () => {
+      const seq = ++pipelineSeqRef.current;
+      const isPick = settings.paletteMode === 'pick';
+      // Copy pixel buffer so the original ImageData stays intact in main thread
+      const imgBuf = imgData.data.slice().buffer;
       try {
-        const isPick = settings.paletteMode === 'pick';
-        const result = runPipeline(
-          imgData,
-          settings.maxWidth,
-          settings.numColors,
-          settings.chamferWidth,
-          settings.removeBg,
-          settings.bgTolerance,
-          settings.smoothing,
-          settings.minRegion,
-          isPick,
-          manualPalette,
-          hasAlpha,
-          fileIsPng
-        );
-        setPipelineResult({
-          colorIndex: result.colorIndex,
-          palette: result.palette,
-          dist: result.dist,
-          BG_INDEX: result.BG_INDEX,
-          tw: result.tw,
-          th: result.th,
-        });
-        if (result.bgMask) {
-          let bgCount = 0;
-          for (let i = 0; i < result.bgMask.length; i++) if (result.bgMask[i]) bgCount++;
-          setBgPercent((bgCount / result.bgMask.length) * 100);
-        } else {
-          setBgPercent(0);
-        }
+        const r = await post<{
+          colorIndex: Uint8Array; palette: RGB[]; dist: Float32Array;
+          BG_INDEX: number; tw: number; th: number; bgMask?: Uint8Array; bgCount: number;
+        }>({
+          type: 'pipeline', imgBuf, imgW: imgData.width, imgH: imgData.height,
+          maxWidth: settings.maxWidth, numColors: settings.numColors,
+          chamferWidth: settings.chamferWidth, removeBg: settings.removeBg,
+          bgTolerance: settings.bgTolerance, smoothing: settings.smoothing,
+          minRegion: settings.minRegion, isPick, manualPalette, hasAlpha, fileIsPng,
+        }, [imgBuf]);
+        if (pipelineSeqRef.current !== seq) return; // stale — newer request in flight
+        setPipelineResult({ colorIndex: r.colorIndex, palette: r.palette, dist: r.dist, BG_INDEX: r.BG_INDEX, tw: r.tw, th: r.th });
+        setBgPercent(r.bgMask ? (r.bgCount / r.bgMask.length) * 100 : 0);
       } catch (e: unknown) {
+        if (pipelineSeqRef.current !== seq) return;
         setStatus(`Pipeline error: ${(e as Error).message}`, 'error');
         console.error('Pipeline error:', e);
       }
     }, 150);
     return () => { if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current); };
-  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus]);
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus, post]);
 
   // ── Color pick ───────────────────────────────────────────────────────────────
   const handleColorPick = useCallback((r: number, g: number, b: number) => {
@@ -185,24 +173,27 @@ export default function App() {
   }, []);
 
   // ── Generate ─────────────────────────────────────────────────────────────────
-  const handleGenerate = useCallback(() => {
+  const handleGenerate = useCallback(async () => {
     if (!imgData) return;
     setIsGenerating(true);
     setStatus('Generating mesh...', 'working');
-    setTimeout(() => {
-      try {
-        const result = generateSTLWithMeshData(imgData, settings, manualPalette, hasAlpha, fileIsPng);
-        setStlBlob(result.blob);
-        setMeshResult(result);
-        const sizeMB = (result.blob.size / (1024 * 1024)).toFixed(2);
-        setStatus(`Done! ${sizeMB} MB, ${(result.triCount / 1000).toFixed(1)}K triangles`, 'done');
-      } catch (e: unknown) {
-        setStatus(`Error: ${(e as Error).message}`, 'error');
-        console.error(e);
-      }
-      setIsGenerating(false);
-    }, 50);
-  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus]);
+    const imgBuf = imgData.data.slice().buffer;
+    try {
+      const r = await post<{
+        stlBuf: ArrayBuffer; tris: Float32Array; colorIndex: Uint8Array; palette: RGB[];
+        BG_INDEX: number; gw: number; gh: number; modelW: number; modelH: number;
+        heights: Float32Array; dx: number; dy: number; mirrorX: boolean; triCount: number;
+      }>({ type: 'generate', imgBuf, imgW: imgData.width, imgH: imgData.height, settings, manualPalette, hasAlpha, fileIsPng }, [imgBuf]);
+      const blob = new Blob([r.stlBuf], { type: 'application/octet-stream' });
+      setStlBlob(blob);
+      setMeshResult({ blob, triCount: r.triCount, tris: r.tris, colorIndex: r.colorIndex, palette: r.palette, BG_INDEX: r.BG_INDEX, gw: r.gw, gh: r.gh, modelW: r.modelW, modelH: r.modelH, heights: r.heights, dx: r.dx, dy: r.dy, mirrorX: r.mirrorX });
+      setStatus(`Done! ${(r.stlBuf.byteLength / (1024 * 1024)).toFixed(2)} MB, ${(r.triCount / 1000).toFixed(1)}K triangles`, 'done');
+    } catch (e: unknown) {
+      setStatus(`Error: ${(e as Error).message}`, 'error');
+      console.error(e);
+    }
+    setIsGenerating(false);
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, post, setStatus]);
 
   const handleDownloadSingle = useCallback(() => {
     if (!stlBlob) return;
@@ -213,25 +204,26 @@ export default function App() {
     URL.revokeObjectURL(a.href);
   }, [stlBlob, fileName]);
 
-  const handleDownloadBambu = useCallback(() => {
+  const handleDownloadBambu = useCallback(async () => {
     if (!imgData) return;
     setStatus('Generating per-color STLs...', 'working');
-    setTimeout(() => {
-      try {
-        const files = generatePerColorSTLs(imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName);
-        const zip = buildZip(files);
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(zip);
-        a.download = `${fileName}_bambu.zip`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-        setStatus(`Done! ${files.length} color STLs zipped.`, 'done');
-      } catch (e: unknown) {
-        setStatus(`Error: ${(e as Error).message}`, 'error');
-        console.error(e);
-      }
-    }, 50);
-  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName, setStatus]);
+    const imgBuf = imgData.data.slice().buffer;
+    try {
+      const r = await post<{ zipBuf: ArrayBuffer; fileCount: number }>(
+        { type: 'bambu', imgBuf, imgW: imgData.width, imgH: imgData.height, settings, manualPalette, hasAlpha, fileIsPng, fileName },
+        [imgBuf]
+      );
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([r.zipBuf], { type: 'application/zip' }));
+      a.download = `${fileName}_bambu.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setStatus(`Done! ${r.fileCount} color STLs zipped.`, 'done');
+    } catch (e: unknown) {
+      setStatus(`Error: ${(e as Error).message}`, 'error');
+      console.error(e);
+    }
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName, post, setStatus]);
 
   const hideZoom = useCallback(() => {
     setZoomLens(prev => ({ ...prev, visible: false, drawFn: null }));
