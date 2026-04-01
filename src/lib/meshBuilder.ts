@@ -204,6 +204,9 @@ export function generateSTLWithMeshData(
 
   const totalTris = tris.length / 9;
   const bufSize = 84 + totalTris * 50;
+  if (bufSize > 500 * 1024 * 1024) {
+    throw new Error(`STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
+  }
   const buf = new ArrayBuffer(bufSize);
   const view = new DataView(buf);
   const header = 'Image-to-STL Color Chamfer (optimized)';
@@ -360,6 +363,9 @@ export function generatePerColorSTLs(
 
     const totalTris = cellCount * 4 + sideCount * 2;
     const bufSize = 84 + totalTris * 50;
+    if (bufSize > 500 * 1024 * 1024) {
+      throw new Error(`Per-color STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
+    }
     const buf = new ArrayBuffer(bufSize);
     const view = new DataView(buf);
 

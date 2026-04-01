@@ -35,7 +35,10 @@ export function Preview3D({ result }: Props) {
 
     const maxDim = Math.max(result.modelW, result.modelH);
     const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, maxDim * 10);
-    camera.position.set(result.modelW * 0.5, -result.modelH * 0.8, maxDim * 0.8);
+    // Camera on the +Y side so image rows appear correctly: row 0 (top) at top of screen.
+    // Camera at -Y put row 0 near the lens (at bottom of screen), and combined with mirrorX's
+    // X-flip the image appeared 180° rotated (very confusing).
+    camera.position.set(result.modelW * 0.5, result.modelH * 1.8, maxDim * 0.8);
     camera.lookAt(result.modelW / 2, result.modelH / 2, 0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
