@@ -344,68 +344,42 @@ export function generatePerColorSTLs(
 
   const results: { name: string; data: Uint8Array }[] = [];
 
+  // Reused across colors to avoid repeated allocations
+  const visitedTop = new Uint8Array((gw - 1) * (gh - 1));
+  const visitedBot = new Uint8Array((gw - 1) * (gh - 1));
+
+  // faceDown flips Z so chamfered face presses against the print bed.
+  // Z-flip reverses winding; X-mirror also reverses winding — they cancel when both active.
+  const totalH = baseH + surfaceH;
+  const doWindingSwap = mirrorX !== faceDown;
+
   for (let ci = 0; ci < palette.length; ci++) {
     const c = palette[ci];
     const colorName = findClosestFilament(c[0], c[1], c[2]).filament[3];
 
-    let cellCount = 0, sideCount = 0;
-    for (let y = 0; y < gh - 1; y++) {
-      for (let x = 0; x < gw - 1; x++) {
-        if (getCellOwner(x, y) !== ci) continue;
-        cellCount++;
-        if (getCellOwner(x - 1, y) !== ci) sideCount++;
-        if (getCellOwner(x + 1, y) !== ci) sideCount++;
-        if (getCellOwner(x, y - 1) !== ci) sideCount++;
-        if (getCellOwner(x, y + 1) !== ci) sideCount++;
-      }
-    }
-    if (cellCount === 0) continue;
+    // Accumulate triangle floats dynamically — avoids giant upfront allocation.
+    // Each triangle = 12 floats (normal xyz + 3 vertices xyz).
+    const triFloats: number[] = [];
+    let triCount = 0;
 
-    const totalTris = cellCount * 4 + sideCount * 2;
-    const bufSize = 84 + totalTris * 50;
-    if (bufSize > 500 * 1024 * 1024) {
-      throw new Error(`Per-color STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
-    }
-    const buf = new ArrayBuffer(bufSize);
-    const view = new DataView(buf);
-
-    const headerStr = `Color ${ci}: ${colorName}`;
-    for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
-    view.setUint32(80, totalTris, true);
-
-    let offset = 84;
-
-    // faceDown flips Z so chamfered face presses against the print bed.
-    // Z-flip reverses winding; X-mirror also reverses winding — they cancel when both active.
-    const totalH = baseH + surfaceH;
-    const doWindingSwap = mirrorX !== faceDown;
-
-    const writeTri = (nx: number, ny: number, nz: number, ax: number, ay: number, az: number,
-                      bx: number, by: number, bz: number, cx: number, cy: number, cz: number) => {
-      view.setFloat32(offset, nx, true); offset += 4;
-      view.setFloat32(offset, ny, true); offset += 4;
-      view.setFloat32(offset, nz, true); offset += 4;
-      view.setFloat32(offset, ax, true); offset += 4;
-      view.setFloat32(offset, ay, true); offset += 4;
-      view.setFloat32(offset, az, true); offset += 4;
-      view.setFloat32(offset, bx, true); offset += 4;
-      view.setFloat32(offset, by, true); offset += 4;
-      view.setFloat32(offset, bz, true); offset += 4;
-      view.setFloat32(offset, cx, true); offset += 4;
-      view.setFloat32(offset, cy, true); offset += 4;
-      view.setFloat32(offset, cz, true); offset += 4;
-      view.setUint16(offset, 0, true); offset += 2;
+    const emitTri = (nx: number, ny: number, nz: number,
+                     ax: number, ay: number, az: number,
+                     bx: number, by: number, bz: number,
+                     cx: number, cy: number, cz: number) => {
+      triFloats.push(nx, ny, nz, ax, ay, az, bx, by, bz, cx, cy, cz);
+      triCount++;
     };
 
-    const addTri = (ax: number, ay: number, az: number, bx: number, by: number, bz: number,
+    const addTri = (ax: number, ay: number, az: number,
+                    bx: number, by: number, bz: number,
                     cx: number, cy: number, cz: number) => {
       if (faceDown) { az=totalH-az; bz=totalH-bz; cz=totalH-cz; }
-      let rbx = bx, rby = by, rbz = bz, rcx = cx, rcy = cy, rcz = cz;
-      if (doWindingSwap) { rbx = cx; rby = cy; rbz = cz; rcx = bx; rcy = by; rcz = bz; }
-      const ux=rbx-ax,uy=rby-ay,uz=rbz-az,vx=rcx-ax,vy=rcy-ay,vz=rcz-az;
-      let nnx=uy*vz-uz*vy, nny=uz*vx-ux*vz, nnz=ux*vy-uy*vx;
+      let rbx=bx, rby=by, rbz=bz, rcx=cx, rcy=cy, rcz=cz;
+      if (doWindingSwap) { rbx=cx; rby=cy; rbz=cz; rcx=bx; rcy=by; rcz=bz; }
+      const ux=rbx-ax,uy=rby-ay,uz=rbz-az, wx=rcx-ax,wy=rcy-ay,wz=rcz-az;
+      let nnx=uy*wz-uz*wy, nny=uz*wx-ux*wz, nnz=ux*wy-uy*wx;
       const len=Math.sqrt(nnx*nnx+nny*nny+nnz*nnz)||1;
-      writeTri(nnx/len,nny/len,nnz/len, ax,ay,az, rbx,rby,rbz, rcx,rcy,rcz);
+      emitTri(nnx/len,nny/len,nnz/len, ax,ay,az, rbx,rby,rbz, rcx,rcy,rcz);
     };
 
     const zAt = (x: number, y: number): number => {
@@ -416,21 +390,79 @@ export function generatePerColorSTLs(
       return baseH + surfaceH - chamferD * (1 - d / chamferW);
     };
 
+    // ── Top face: greedy rectangle merging for flat interior cells ────────────
+    // Interior cells are all at baseH+surfaceH and merge into large rectangles,
+    // collapsing millions of quads into a handful of tris.
+    visitedTop.fill(0);
+    for (let y = 0; y < gh - 1; y++) {
+      for (let x = 0; x < gw - 1; x++) {
+        const qi = y * (gw - 1) + x;
+        if (visitedTop[qi] || getCellOwner(x, y) !== ci) continue;
+
+        const z00=zAt(x,y), z10=zAt(x+1,y), z01=zAt(x,y+1), z11=zAt(x+1,y+1);
+
+        if (z00 !== z10 || z00 !== z01 || z00 !== z11) {
+          // Non-flat boundary cell — emit two individual tris
+          visitedTop[qi] = 1;
+          addTri(vtxX[y*gw+x],vtxY[y*gw+x],z00, vtxX[y*gw+x+1],vtxY[y*gw+x+1],z10, vtxX[(y+1)*gw+x+1],vtxY[(y+1)*gw+x+1],z11);
+          addTri(vtxX[y*gw+x],vtxY[y*gw+x],z00, vtxX[(y+1)*gw+x+1],vtxY[(y+1)*gw+x+1],z11, vtxX[(y+1)*gw+x],vtxY[(y+1)*gw+x],z01);
+          continue;
+        }
+
+        const h = z00;
+        // Greedy expand right
+        let maxX = x;
+        while (maxX + 1 < gw - 1 && !visitedTop[y*(gw-1)+maxX+1] && getCellOwner(maxX+1,y)===ci) {
+          if (zAt(maxX+1,y)!==h || zAt(maxX+2,y)!==h || zAt(maxX+1,y+1)!==h || zAt(maxX+2,y+1)!==h) break;
+          maxX++;
+        }
+        // Greedy expand down
+        let maxY = y;
+        outerTop: while (maxY + 1 < gh - 1) {
+          for (let xx = x; xx <= maxX; xx++) {
+            if (visitedTop[(maxY+1)*(gw-1)+xx] || getCellOwner(xx,maxY+1)!==ci) break outerTop;
+            if (zAt(xx,maxY+1)!==h || zAt(xx+1,maxY+1)!==h || zAt(xx,maxY+2)!==h || zAt(xx+1,maxY+2)!==h) break outerTop;
+          }
+          maxY++;
+        }
+        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedTop[yy*(gw-1)+xx] = 1;
+
+        addTri(vtxX[y*gw+x],vtxY[y*gw+x],h, vtxX[y*gw+maxX+1],vtxY[y*gw+maxX+1],h, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],h);
+        addTri(vtxX[y*gw+x],vtxY[y*gw+x],h, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],h, vtxX[(maxY+1)*gw+x],vtxY[(maxY+1)*gw+x],h);
+      }
+    }
+
+    // ── Bottom face: always flat at z=0 — merge aggressively ─────────────────
+    visitedBot.fill(0);
+    for (let y = 0; y < gh - 1; y++) {
+      for (let x = 0; x < gw - 1; x++) {
+        const qi = y * (gw - 1) + x;
+        if (visitedBot[qi] || getCellOwner(x, y) !== ci) continue;
+        let maxX = x;
+        while (maxX+1 < gw-1 && !visitedBot[y*(gw-1)+maxX+1] && getCellOwner(maxX+1,y)===ci) maxX++;
+        let maxY = y;
+        outerBot: while (maxY + 1 < gh - 1) {
+          for (let xx = x; xx <= maxX; xx++) {
+            if (visitedBot[(maxY+1)*(gw-1)+xx] || getCellOwner(xx,maxY+1)!==ci) break outerBot;
+          }
+          maxY++;
+        }
+        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedBot[yy*(gw-1)+xx] = 1;
+
+        addTri(vtxX[y*gw+x],vtxY[y*gw+x],0, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],0, vtxX[y*gw+maxX+1],vtxY[y*gw+maxX+1],0);
+        addTri(vtxX[y*gw+x],vtxY[y*gw+x],0, vtxX[(maxY+1)*gw+x],vtxY[(maxY+1)*gw+x],0, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],0);
+      }
+    }
+
+    // ── Side faces (per-cell, unchanged) ─────────────────────────────────────
     for (let y = 0; y < gh - 1; y++) {
       for (let x = 0; x < gw - 1; x++) {
         if (getCellOwner(x, y) !== ci) continue;
-        const i00=y*gw+x, i10=y*gw+x+1, i01=(y+1)*gw+x, i11=(y+1)*gw+x+1;
-        const vx0=vtxX[i00],vy0=vtxY[i00];
-        const vx1=vtxX[i10],vy1=vtxY[i10];
-        const vx2=vtxX[i01],vy2=vtxY[i01];
-        const vx3=vtxX[i11],vy3=vtxY[i11];
-        const z00=zAt(x,y),z10=zAt(x+1,y),z01=zAt(x,y+1),z11=zAt(x+1,y+1);
-
-        addTri(vx0,vy0,z00, vx1,vy1,z10, vx3,vy3,z11);
-        addTri(vx0,vy0,z00, vx3,vy3,z11, vx2,vy2,z01);
-        addTri(vx0,vy0,0, vx3,vy3,0, vx1,vy1,0);
-        addTri(vx0,vy0,0, vx2,vy2,0, vx3,vy3,0);
-
+        const vx0=vtxX[y*gw+x],vy0=vtxY[y*gw+x];
+        const vx1=vtxX[y*gw+x+1],vy1=vtxY[y*gw+x+1];
+        const vx2=vtxX[(y+1)*gw+x],vy2=vtxY[(y+1)*gw+x];
+        const vx3=vtxX[(y+1)*gw+x+1],vy3=vtxY[(y+1)*gw+x+1];
+        const z00=zAt(x,y), z10=zAt(x+1,y), z01=zAt(x,y+1), z11=zAt(x+1,y+1);
         if (getCellOwner(x-1,y) !== ci) {
           addTri(vx0,vy0,0, vx2,vy2,z01, vx2,vy2,0);
           addTri(vx0,vy0,0, vx0,vy0,z00, vx2,vy2,z01);
@@ -450,14 +482,29 @@ export function generatePerColorSTLs(
       }
     }
 
-    const actualSize = offset;
-    const actualTris = (actualSize - 84) / 50;
-    const finalBuf = buf.slice(0, actualSize);
-    const finalView = new DataView(finalBuf);
-    finalView.setUint32(80, actualTris, true);
+    if (triCount === 0) continue;
+
+    // Build final STL buffer now that we know the exact triangle count
+    const bufSize = 84 + triCount * 50;
+    if (bufSize > 500 * 1024 * 1024) {
+      throw new Error(`Per-color STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
+    }
+    const buf = new ArrayBuffer(bufSize);
+    const view = new DataView(buf);
+
+    const headerStr = `Color ${ci}: ${colorName}`;
+    for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
+    view.setUint32(80, triCount, true);
+
+    let offset = 84;
+    for (let t = 0; t < triCount; t++) {
+      const base = t * 12;
+      for (let k = 0; k < 12; k++) { view.setFloat32(offset, triFloats[base + k], true); offset += 4; }
+      view.setUint16(offset, 0, true); offset += 2;
+    }
 
     const safeName = colorName.replace(/[^a-zA-Z0-9]/g, '_');
-    results.push({ name: `${fileName}_${ci}_${safeName}.stl`, data: new Uint8Array(finalBuf) });
+    results.push({ name: `${fileName}_${ci}_${safeName}.stl`, data: new Uint8Array(buf) });
   }
 
   return results;
