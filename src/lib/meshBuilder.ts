@@ -333,6 +333,7 @@ export function generatePerColorSTLs(
       if (votes.size === 0) continue;
       let bestC = -1, bestV = 0;
       for (const [c, count] of votes) { if (count > bestV) { bestV = count; bestC = c; } }
+      if (bestV < 2) continue; // require ≥2 corners to agree — 1-corner cells create tiny spike fragments
       cellOwner[y * (gw - 1) + x] = bestC;
     }
   }
