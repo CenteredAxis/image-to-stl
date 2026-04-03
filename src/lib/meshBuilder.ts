@@ -334,6 +334,10 @@ export function generatePerColorSTLs(
       let bestC = -1, bestV = 0;
       for (const [c, count] of votes) { if (count > bestV) { bestV = count; bestC = c; } }
       if (bestV < 2) continue; // require ≥2 corners to agree — 1-corner cells create tiny spike fragments
+      // Also require at least one corner of the winning color to be in a large enough component.
+      // cellColorMask marks vertices whose connected component meets the minRegion threshold.
+      const corners = [i00, i10, i01, i11];
+      if (!corners.some(v => colorIndex[v] === bestC && cellColorMask[v])) continue;
       cellOwner[y * (gw - 1) + x] = bestC;
     }
   }
