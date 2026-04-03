@@ -391,8 +391,10 @@ export function generatePerColorSTLs(
       const idx = y * gw + x;
       if (colorIndex[idx] !== ci) return baseH;
       const d = dist[idx];
-      if (d >= chamferW) return baseH + surfaceH;
-      return baseH + surfaceH - chamferD * (1 - d / chamferW);
+      let h: number;
+      if (d >= chamferW) h = baseH + surfaceH;
+      else h = baseH + surfaceH - chamferD * (1 - d / chamferW);
+      return Math.round(h * 100) / 100;
     };
 
     // ── Top face: greedy rectangle merging for flat interior cells ────────────
@@ -459,31 +461,96 @@ export function generatePerColorSTLs(
       }
     }
 
-    // ── Side faces (per-cell, unchanged) ─────────────────────────────────────
+    // ── Side faces: greedy-merge equal-height runs ───────────────────────────
+    // Any run of consecutive boundary cells whose edge vertices are all the same
+    // height merges into one quad. Interior cells (flatH) and bg-adjacent cells
+    // (baseH) both benefit; only chamfer transition cells stay per-cell.
+
+    // LEFT side (left edge at column x, merge in Y direction)
+    for (let x = 0; x < gw - 1; x++) {
+      let y = 0;
+      while (y < gh - 1) {
+        if (getCellOwner(x, y) !== ci || getCellOwner(x-1, y) === ci) { y++; continue; }
+        const z0 = zAt(x, y);
+        let maxY = y;
+        while (maxY + 1 < gh - 1) {
+          const next = maxY + 1;
+          if (getCellOwner(x, next) !== ci || getCellOwner(x-1, next) === ci) break;
+          if (zAt(x, next) !== z0 || zAt(x, next+1) !== z0) break;
+          maxY = next;
+        }
+        const z1 = zAt(x, maxY+1);
+        const vA0=vtxX[y*gw+x], vA1=vtxY[y*gw+x];
+        const vB0=vtxX[(maxY+1)*gw+x], vB1=vtxY[(maxY+1)*gw+x];
+        addTri(vA0,vA1,0, vB0,vB1,z1, vB0,vB1,0);
+        addTri(vA0,vA1,0, vA0,vA1,z0, vB0,vB1,z1);
+        y = maxY + 1;
+      }
+    }
+
+    // RIGHT side (right edge at column x+1, merge in Y direction)
+    for (let x = 0; x < gw - 1; x++) {
+      let y = 0;
+      while (y < gh - 1) {
+        if (getCellOwner(x, y) !== ci || getCellOwner(x+1, y) === ci) { y++; continue; }
+        const z0 = zAt(x+1, y);
+        let maxY = y;
+        while (maxY + 1 < gh - 1) {
+          const next = maxY + 1;
+          if (getCellOwner(x, next) !== ci || getCellOwner(x+1, next) === ci) break;
+          if (zAt(x+1, next) !== z0 || zAt(x+1, next+1) !== z0) break;
+          maxY = next;
+        }
+        const z1 = zAt(x+1, maxY+1);
+        const vA0=vtxX[y*gw+x+1], vA1=vtxY[y*gw+x+1];
+        const vB0=vtxX[(maxY+1)*gw+x+1], vB1=vtxY[(maxY+1)*gw+x+1];
+        addTri(vA0,vA1,0, vB0,vB1,0, vB0,vB1,z1);
+        addTri(vA0,vA1,0, vB0,vB1,z1, vA0,vA1,z0);
+        y = maxY + 1;
+      }
+    }
+
+    // FRONT side (top edge at row y, merge in X direction)
     for (let y = 0; y < gh - 1; y++) {
-      for (let x = 0; x < gw - 1; x++) {
-        if (getCellOwner(x, y) !== ci) continue;
-        const vx0=vtxX[y*gw+x],vy0=vtxY[y*gw+x];
-        const vx1=vtxX[y*gw+x+1],vy1=vtxY[y*gw+x+1];
-        const vx2=vtxX[(y+1)*gw+x],vy2=vtxY[(y+1)*gw+x];
-        const vx3=vtxX[(y+1)*gw+x+1],vy3=vtxY[(y+1)*gw+x+1];
-        const z00=zAt(x,y), z10=zAt(x+1,y), z01=zAt(x,y+1), z11=zAt(x+1,y+1);
-        if (getCellOwner(x-1,y) !== ci) {
-          addTri(vx0,vy0,0, vx2,vy2,z01, vx2,vy2,0);
-          addTri(vx0,vy0,0, vx0,vy0,z00, vx2,vy2,z01);
+      let x = 0;
+      while (x < gw - 1) {
+        if (getCellOwner(x, y) !== ci || getCellOwner(x, y-1) === ci) { x++; continue; }
+        const z0 = zAt(x, y);
+        let maxX = x;
+        while (maxX + 1 < gw - 1) {
+          const next = maxX + 1;
+          if (getCellOwner(next, y) !== ci || getCellOwner(next, y-1) === ci) break;
+          if (zAt(next, y) !== z0 || zAt(next+1, y) !== z0) break;
+          maxX = next;
         }
-        if (getCellOwner(x+1,y) !== ci) {
-          addTri(vx1,vy1,0, vx3,vy3,0, vx3,vy3,z11);
-          addTri(vx1,vy1,0, vx3,vy3,z11, vx1,vy1,z10);
+        const z1 = zAt(maxX+1, y);
+        const vA0=vtxX[y*gw+x], vA1=vtxY[y*gw+x];
+        const vB0=vtxX[y*gw+maxX+1], vB1=vtxY[y*gw+maxX+1];
+        addTri(vA0,vA1,0, vB0,vB1,0, vB0,vB1,z1);
+        addTri(vA0,vA1,0, vB0,vB1,z1, vA0,vA1,z0);
+        x = maxX + 1;
+      }
+    }
+
+    // BACK side (bottom edge at row y+1, merge in X direction)
+    for (let y = 0; y < gh - 1; y++) {
+      let x = 0;
+      while (x < gw - 1) {
+        if (getCellOwner(x, y) !== ci || getCellOwner(x, y+1) === ci) { x++; continue; }
+        const z0 = zAt(x, y+1);
+        let maxX = x;
+        while (maxX + 1 < gw - 1) {
+          const next = maxX + 1;
+          if (getCellOwner(next, y) !== ci || getCellOwner(next, y+1) === ci) break;
+          if (zAt(next, y+1) !== z0 || zAt(next+1, y+1) !== z0) break;
+          maxX = next;
         }
-        if (getCellOwner(x,y-1) !== ci) {
-          addTri(vx0,vy0,0, vx1,vy1,0, vx1,vy1,z10);
-          addTri(vx0,vy0,0, vx1,vy1,z10, vx0,vy0,z00);
-        }
-        if (getCellOwner(x,y+1) !== ci) {
-          addTri(vx2,vy2,0, vx3,vy3,z11, vx3,vy3,0);
-          addTri(vx2,vy2,0, vx2,vy2,z01, vx3,vy3,z11);
-        }
+        const z1 = zAt(maxX+1, y+1);
+        const vA0=vtxX[(y+1)*gw+x], vA1=vtxY[(y+1)*gw+x];
+        const vB0=vtxX[(y+1)*gw+maxX+1], vB1=vtxY[(y+1)*gw+maxX+1];
+        addTri(vA0,vA1,0, vB0,vB1,z1, vB0,vB1,0);
+        addTri(vA0,vA1,0, vA0,vA1,z0, vB0,vB1,z1);
+        x = maxX + 1;
       }
     }
 
