@@ -1,5 +1,5 @@
 import { runPipeline } from './imagePipeline';
-import { generateSTLWithMeshData, generatePerColorSTLs } from './meshBuilder';
+import { generateSTLWithMeshData, generatePerColorSTLsFromMesh } from './meshBuilder';
 import { buildZip } from './zip';
 import type { Settings, RGB } from '../types';
 
@@ -50,18 +50,19 @@ function makeImgData(buf: ArrayBuffer, w: number, h: number): ImageData {
       const imgData = makeImgData(imgBuf, imgW, imgH);
       const r = generateSTLWithMeshData(imgData, settings, manualPalette, hasAlpha, fileIsPng);
       const stlBuf = await r.blob.arrayBuffer();
-      const transfers: Transferable[] = [stlBuf, r.tris.buffer, r.heights.buffer, r.colorIndex.buffer];
+      const transfers: Transferable[] = [stlBuf, r.tris.buffer, r.heights.buffer, r.colorIndex.buffer, r.vtxX.buffer, r.vtxY.buffer];
       (self as unknown as Worker).postMessage(
         { type, id, stlBuf, tris: r.tris, colorIndex: r.colorIndex, palette: r.palette,
           BG_INDEX: r.BG_INDEX, gw: r.gw, gh: r.gh, modelW: r.modelW, modelH: r.modelH,
-          heights: r.heights, dx: r.dx, dy: r.dy, mirrorX: r.mirrorX, triCount: r.triCount },
+          heights: r.heights, vtxX: r.vtxX, vtxY: r.vtxY, dx: r.dx, dy: r.dy, mirrorX: r.mirrorX, triCount: r.triCount },
         transfers
       );
 
     } else if (type === 'bambu') {
       const { imgBuf, imgW, imgH, settings, manualPalette, hasAlpha, fileIsPng, fileName } = e.data;
       const imgData = makeImgData(imgBuf, imgW, imgH);
-      const files = generatePerColorSTLs(imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName);
+      const mesh = generateSTLWithMeshData(imgData, settings, manualPalette, hasAlpha, fileIsPng);
+      const files = generatePerColorSTLsFromMesh(mesh, settings, fileName);
       const zip = buildZip(files);
       const zipBuf = await zip.arrayBuffer();
       (self as unknown as Worker).postMessage({ type, id, zipBuf, fileCount: files.length }, [zipBuf]);

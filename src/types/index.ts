@@ -29,6 +29,8 @@ export interface MeshResult {
   modelW: number;
   modelH: number;
   heights: Float32Array;
+  vtxX: Float32Array;
+  vtxY: Float32Array;
   dx: number;
   dy: number;
   mirrorX: boolean;

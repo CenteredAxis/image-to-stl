@@ -249,54 +249,22 @@ export function generateSTLWithMeshData(
   }
 
   const blob = new Blob([buf], { type: 'application/octet-stream' });
-  return { blob, triCount: totalTris, tris: new Float32Array(tris), colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, dx, dy, mirrorX };
+  return { blob, triCount: totalTris, tris: new Float32Array(tris), colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, vtxX: vx, vtxY: vy, dx, dy, mirrorX };
 }
 
-export function generatePerColorSTLs(
-  imgData: ImageData,
+// Derives per-color STLs directly from the combined mesh result so that vertex
+// positions, heights, and chamfer profiles are identical to the single combined STL.
+// No independent re-computation — the assembled per-color result matches the preview exactly.
+export function generatePerColorSTLsFromMesh(
+  mesh: MeshResult,
   settings: Settings,
-  manualPalette: RGB[],
-  hasAlpha: boolean,
-  fileIsPng: boolean,
   fileName: string
 ): { name: string; data: Uint8Array }[] {
-  const {
-    maxWidth, numColors, surfaceHeight: surfaceH, baseHeight: baseH,
-    chamferDepth: chamferD, chamferWidth: chamferW, modelWidth: modelW,
-    removeBg, bgTolerance: bgTol, smoothing: smoothSigma,
-    minRegion, paletteMode, mirrorX, faceDown
-  } = settings;
-  const isPick = paletteMode === 'pick';
+  const { colorIndex, palette, BG_INDEX, gw, gh, heights, vtxX: vx, vtxY: vy } = mesh;
+  const { baseHeight: baseH, surfaceHeight: surfaceH, hollow, mirrorX, faceDown, minRegion } = settings;
+  const bottomZ = hollow ? baseH * 0.5 : 0;
 
-  const aspect = imgData.height / imgData.width;
-  const gw = maxWidth, gh = Math.max(2, Math.round(maxWidth * aspect));
-
-  const bgMask = removeBg ? computeBgMask(imgData, gw, gh, bgTol, hasAlpha, fileIsPng) : null;
-  const fp = (isPick && manualPalette.length > 0) ? manualPalette : null;
-  const { colorIndex, palette, BG_INDEX } = quantizeColors(imgData, gw, gh, numColors, bgMask, fp);
-
-  cleanColorIndex(colorIndex, gw, gh, minRegion, BG_INDEX);
-  cleanColorIndex(colorIndex, gw, gh, Math.max(5, Math.floor(minRegion / 2)), BG_INDEX);
-  erodeThinStrips(colorIndex, gw, gh, BG_INDEX);
-
-  const contours = extractBoundaryContours(colorIndex, gw, gh, BG_INDEX);
-  const dist = computeBoundaryDist(colorIndex, gw, gh, chamferW, contours);
-  blurDistanceField(dist, colorIndex, gw, gh, smoothSigma, BG_INDEX);
-
-  const modelH = modelW * aspect;
-  const dx = modelW / (gw - 1), dy = modelH / (gh - 1);
-
-  const vtxX = new Float32Array(gw * gh);
-  const vtxY = new Float32Array(gw * gh);
-  for (let gy = 0; gy < gh; gy++) {
-    for (let gx = 0; gx < gw; gx++) {
-      const idx = gy * gw + gx;
-      const rawX = (gx + contours.offX[idx]) * dx;
-      vtxX[idx] = mirrorX ? (modelW - rawX) : rawX;
-      vtxY[idx] = (gy + contours.offY[idx]) * dy;
-    }
-  }
-
+  // Mark vertices belonging to large-enough connected components (filters tiny isolated blobs)
   const cellColorMask = new Uint8Array(gw * gh);
   {
     const visited = new Uint8Array(gw * gh);
@@ -309,52 +277,43 @@ export function generatePerColorSTLs(
       while (head < comp.length) {
         const idx = comp[head++];
         const cx = idx % gw, cy = (idx - cx) / gw;
-        const neighbors: number[] = [];
-        if (cx > 0) neighbors.push(idx - 1);
-        if (cx < gw - 1) neighbors.push(idx + 1);
-        if (cy > 0) neighbors.push(idx - gw);
-        if (cy < gh - 1) neighbors.push(idx + gw);
-        for (const ni of neighbors) {
-          if (!visited[ni] && colorIndex[ni] === color) { visited[ni] = 1; comp.push(ni); }
-        }
+        if (cx > 0 && !visited[idx-1] && colorIndex[idx-1] === color) { visited[idx-1]=1; comp.push(idx-1); }
+        if (cx < gw-1 && !visited[idx+1] && colorIndex[idx+1] === color) { visited[idx+1]=1; comp.push(idx+1); }
+        if (cy > 0 && !visited[idx-gw] && colorIndex[idx-gw] === color) { visited[idx-gw]=1; comp.push(idx-gw); }
+        if (cy < gh-1 && !visited[idx+gw] && colorIndex[idx+gw] === color) { visited[idx+gw]=1; comp.push(idx+gw); }
       }
       const threshold = Math.max(minRegion, 10);
       if (comp.length >= threshold) for (const idx of comp) cellColorMask[idx] = 1;
     }
   }
 
-  const cellOwner = new Int16Array((gw - 1) * (gh - 1)).fill(-1);
-  for (let y = 0; y < gh - 1; y++) {
-    for (let x = 0; x < gw - 1; x++) {
+  // Assign each cell to the majority color of its 4 corners (≥2 required)
+  const cellOwner = new Int16Array((gw-1) * (gh-1)).fill(-1);
+  for (let y = 0; y < gh-1; y++) {
+    for (let x = 0; x < gw-1; x++) {
       const i00=y*gw+x, i10=y*gw+x+1, i01=(y+1)*gw+x, i11=(y+1)*gw+x+1;
-      const v = [colorIndex[i00], colorIndex[i10], colorIndex[i01], colorIndex[i11]];
       const votes = new Map<number, number>();
-      for (const ci of v) { if (ci !== BG_INDEX) votes.set(ci, (votes.get(ci) || 0) + 1); }
+      for (const v of [colorIndex[i00], colorIndex[i10], colorIndex[i01], colorIndex[i11]]) {
+        if (v !== BG_INDEX) votes.set(v, (votes.get(v)||0)+1);
+      }
       if (votes.size === 0) continue;
       let bestC = -1, bestV = 0;
       for (const [c, count] of votes) { if (count > bestV) { bestV = count; bestC = c; } }
-      if (bestV < 2) continue; // require ≥2 corners to agree — 1-corner cells create tiny spike fragments
-      // Also require at least one corner of the winning color to be in a large enough component.
-      // cellColorMask marks vertices whose connected component meets the minRegion threshold.
-      const corners = [i00, i10, i01, i11];
-      if (!corners.some(v => colorIndex[v] === bestC && cellColorMask[v])) continue;
-      cellOwner[y * (gw - 1) + x] = bestC;
+      if (bestV < 2) continue;
+      if (![i00,i10,i01,i11].some(v => colorIndex[v] === bestC && cellColorMask[v])) continue;
+      cellOwner[y*(gw-1)+x] = bestC;
     }
   }
 
   const getCellOwner = (x: number, y: number): number => {
-    if (x < 0 || x >= gw - 1 || y < 0 || y >= gh - 1) return -1;
-    return cellOwner[y * (gw - 1) + x];
+    if (x < 0 || x >= gw-1 || y < 0 || y >= gh-1) return -1;
+    return cellOwner[y*(gw-1)+x];
   };
 
   const results: { name: string; data: Uint8Array }[] = [];
+  const visitedTop = new Uint8Array((gw-1) * (gh-1));
+  const visitedBot = new Uint8Array((gw-1) * (gh-1));
 
-  // Reused across colors to avoid repeated allocations
-  const visitedTop = new Uint8Array((gw - 1) * (gh - 1));
-  const visitedBot = new Uint8Array((gw - 1) * (gh - 1));
-
-  // faceDown flips Z so chamfered face presses against the print bed.
-  // Z-flip reverses winding; X-mirror also reverses winding — they cancel when both active.
   const totalH = baseH + surfaceH;
   const doWindingSwap = mirrorX !== faceDown;
 
@@ -362,8 +321,6 @@ export function generatePerColorSTLs(
     const c = palette[ci];
     const colorName = findClosestFilament(c[0], c[1], c[2]).filament[3];
 
-    // Accumulate triangle floats dynamically — avoids giant upfront allocation.
-    // Each triangle = 12 floats (normal xyz + 3 vertices xyz).
     const triFloats: number[] = [];
     let triCount = 0;
 
@@ -387,194 +344,160 @@ export function generatePerColorSTLs(
       emitTri(nnx/len,nny/len,nnz/len, ax,ay,az, rbx,rby,rbz, rcx,rcy,rcz);
     };
 
-    const zAt = (x: number, y: number): number => {
-      const idx = y * gw + x;
-      if (colorIndex[idx] !== ci) return baseH;
-      const d = dist[idx];
-      let h: number;
-      if (d >= chamferW) h = baseH + surfaceH;
-      else h = baseH + surfaceH - chamferD * (1 - d / chamferW);
-      return Math.round(h * 100) / 100;
+    // Height from shared combined-mesh array — already rounded, identical to preview
+    const hv = (x: number, y: number) => heights[y * gw + x];
+
+    const cellFlat = (x: number, y: number) => {
+      const h00=hv(x,y), h10=hv(x+1,y), h01=hv(x,y+1), h11=hv(x+1,y+1);
+      return h00===h10 && h00===h01 && h00===h11;
     };
 
-    // ── Top face: greedy rectangle merging for flat interior cells ────────────
-    // Interior cells are all at baseH+surfaceH and merge into large rectangles,
-    // collapsing millions of quads into a handful of tris.
+    // ── Top face: greedy rectangle merge filtered by color ────────────────────
     visitedTop.fill(0);
-    for (let y = 0; y < gh - 1; y++) {
-      for (let x = 0; x < gw - 1; x++) {
-        const qi = y * (gw - 1) + x;
-        if (visitedTop[qi] || getCellOwner(x, y) !== ci) continue;
-
-        const z00=zAt(x,y), z10=zAt(x+1,y), z01=zAt(x,y+1), z11=zAt(x+1,y+1);
-
-        if (z00 !== z10 || z00 !== z01 || z00 !== z11) {
-          // Non-flat boundary cell — emit two individual tris
+    for (let y = 0; y < gh-1; y++) {
+      for (let x = 0; x < gw-1; x++) {
+        const qi = y*(gw-1)+x;
+        if (visitedTop[qi] || getCellOwner(x,y) !== ci) continue;
+        if (!cellFlat(x,y)) {
           visitedTop[qi] = 1;
-          addTri(vtxX[y*gw+x],vtxY[y*gw+x],z00, vtxX[y*gw+x+1],vtxY[y*gw+x+1],z10, vtxX[(y+1)*gw+x+1],vtxY[(y+1)*gw+x+1],z11);
-          addTri(vtxX[y*gw+x],vtxY[y*gw+x],z00, vtxX[(y+1)*gw+x+1],vtxY[(y+1)*gw+x+1],z11, vtxX[(y+1)*gw+x],vtxY[(y+1)*gw+x],z01);
+          addTri(vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[y*gw+x+1],vy[y*gw+x+1],hv(x+1,y), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1));
+          addTri(vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1), vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1));
           continue;
         }
-
-        const h = z00;
-        // Greedy expand right
+        const h = hv(x,y);
         let maxX = x;
-        while (maxX + 1 < gw - 1 && !visitedTop[y*(gw-1)+maxX+1] && getCellOwner(maxX+1,y)===ci) {
-          if (zAt(maxX+1,y)!==h || zAt(maxX+2,y)!==h || zAt(maxX+1,y+1)!==h || zAt(maxX+2,y+1)!==h) break;
-          maxX++;
-        }
-        // Greedy expand down
+        while (maxX+1 < gw-1 && !visitedTop[y*(gw-1)+maxX+1] && getCellOwner(maxX+1,y)===ci &&
+               cellFlat(maxX+1,y) && hv(maxX+1,y)===h) maxX++;
         let maxY = y;
-        outerTop: while (maxY + 1 < gh - 1) {
-          for (let xx = x; xx <= maxX; xx++) {
-            if (visitedTop[(maxY+1)*(gw-1)+xx] || getCellOwner(xx,maxY+1)!==ci) break outerTop;
-            if (zAt(xx,maxY+1)!==h || zAt(xx+1,maxY+1)!==h || zAt(xx,maxY+2)!==h || zAt(xx+1,maxY+2)!==h) break outerTop;
+        outerTop: while (maxY+1 < gh-1) {
+          for (let xx=x; xx<=maxX; xx++) {
+            if (visitedTop[(maxY+1)*(gw-1)+xx] || getCellOwner(xx,maxY+1)!==ci ||
+                !cellFlat(xx,maxY+1) || hv(xx,maxY+1)!==h) break outerTop;
           }
           maxY++;
         }
-        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedTop[yy*(gw-1)+xx] = 1;
-
-        addTri(vtxX[y*gw+x],vtxY[y*gw+x],h, vtxX[y*gw+maxX+1],vtxY[y*gw+maxX+1],h, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],h);
-        addTri(vtxX[y*gw+x],vtxY[y*gw+x],h, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],h, vtxX[(maxY+1)*gw+x],vtxY[(maxY+1)*gw+x],h);
+        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedTop[yy*(gw-1)+xx]=1;
+        addTri(vx[y*gw+x],vy[y*gw+x],h, vx[y*gw+maxX+1],vy[y*gw+maxX+1],h, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],h);
+        addTri(vx[y*gw+x],vy[y*gw+x],h, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],h, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],h);
       }
     }
 
-    // ── Bottom face: always flat at z=0 — merge aggressively ─────────────────
+    // ── Bottom face: greedy merge ─────────────────────────────────────────────
     visitedBot.fill(0);
-    for (let y = 0; y < gh - 1; y++) {
-      for (let x = 0; x < gw - 1; x++) {
-        const qi = y * (gw - 1) + x;
-        if (visitedBot[qi] || getCellOwner(x, y) !== ci) continue;
+    for (let y = 0; y < gh-1; y++) {
+      for (let x = 0; x < gw-1; x++) {
+        const qi = y*(gw-1)+x;
+        if (visitedBot[qi] || getCellOwner(x,y) !== ci) continue;
         let maxX = x;
         while (maxX+1 < gw-1 && !visitedBot[y*(gw-1)+maxX+1] && getCellOwner(maxX+1,y)===ci) maxX++;
         let maxY = y;
-        outerBot: while (maxY + 1 < gh - 1) {
-          for (let xx = x; xx <= maxX; xx++) {
+        outerBot: while (maxY+1 < gh-1) {
+          for (let xx=x; xx<=maxX; xx++) {
             if (visitedBot[(maxY+1)*(gw-1)+xx] || getCellOwner(xx,maxY+1)!==ci) break outerBot;
           }
           maxY++;
         }
-        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedBot[yy*(gw-1)+xx] = 1;
-
-        addTri(vtxX[y*gw+x],vtxY[y*gw+x],0, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],0, vtxX[y*gw+maxX+1],vtxY[y*gw+maxX+1],0);
-        addTri(vtxX[y*gw+x],vtxY[y*gw+x],0, vtxX[(maxY+1)*gw+x],vtxY[(maxY+1)*gw+x],0, vtxX[(maxY+1)*gw+maxX+1],vtxY[(maxY+1)*gw+maxX+1],0);
+        for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedBot[yy*(gw-1)+xx]=1;
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],bottomZ);
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],bottomZ, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],bottomZ);
       }
     }
 
-    // ── Side faces: greedy-merge equal-height runs ───────────────────────────
-    // Any run of consecutive boundary cells whose edge vertices are all the same
-    // height merges into one quad. Interior cells (flatH) and bg-adjacent cells
-    // (baseH) both benefit; only chamfer transition cells stay per-cell.
-
-    // LEFT side (left edge at column x, merge in Y direction)
-    for (let x = 0; x < gw - 1; x++) {
+    // ── Side faces: greedy-merge equal-height runs ────────────────────────────
+    // LEFT side
+    for (let x = 0; x < gw-1; x++) {
       let y = 0;
-      while (y < gh - 1) {
-        if (getCellOwner(x, y) !== ci || getCellOwner(x-1, y) === ci) { y++; continue; }
-        const z0 = zAt(x, y);
+      while (y < gh-1) {
+        if (getCellOwner(x,y) !== ci || getCellOwner(x-1,y) === ci) { y++; continue; }
+        const z0 = hv(x,y);
         let maxY = y;
-        while (maxY + 1 < gh - 1) {
-          const next = maxY + 1;
-          if (getCellOwner(x, next) !== ci || getCellOwner(x-1, next) === ci) break;
-          if (zAt(x, next) !== z0 || zAt(x, next+1) !== z0) break;
+        while (maxY+1 < gh-1) {
+          const next = maxY+1;
+          if (getCellOwner(x,next) !== ci || getCellOwner(x-1,next) === ci) break;
+          if (hv(x,next) !== z0 || hv(x,next+1) !== z0) break;
           maxY = next;
         }
-        const z1 = zAt(x, maxY+1);
-        const vA0=vtxX[y*gw+x], vA1=vtxY[y*gw+x];
-        const vB0=vtxX[(maxY+1)*gw+x], vB1=vtxY[(maxY+1)*gw+x];
-        addTri(vA0,vA1,0, vB0,vB1,z1, vB0,vB1,0);
-        addTri(vA0,vA1,0, vA0,vA1,z0, vB0,vB1,z1);
-        y = maxY + 1;
+        const z1 = hv(x,maxY+1);
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],z1, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],bottomZ);
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+x],vy[y*gw+x],z0, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],z1);
+        y = maxY+1;
       }
     }
-
-    // RIGHT side (right edge at column x+1, merge in Y direction)
-    for (let x = 0; x < gw - 1; x++) {
+    // RIGHT side
+    for (let x = 0; x < gw-1; x++) {
       let y = 0;
-      while (y < gh - 1) {
-        if (getCellOwner(x, y) !== ci || getCellOwner(x+1, y) === ci) { y++; continue; }
-        const z0 = zAt(x+1, y);
+      while (y < gh-1) {
+        if (getCellOwner(x,y) !== ci || getCellOwner(x+1,y) === ci) { y++; continue; }
+        const z0 = hv(x+1,y);
         let maxY = y;
-        while (maxY + 1 < gh - 1) {
-          const next = maxY + 1;
-          if (getCellOwner(x, next) !== ci || getCellOwner(x+1, next) === ci) break;
-          if (zAt(x+1, next) !== z0 || zAt(x+1, next+1) !== z0) break;
+        while (maxY+1 < gh-1) {
+          const next = maxY+1;
+          if (getCellOwner(x,next) !== ci || getCellOwner(x+1,next) === ci) break;
+          if (hv(x+1,next) !== z0 || hv(x+1,next+1) !== z0) break;
           maxY = next;
         }
-        const z1 = zAt(x+1, maxY+1);
-        const vA0=vtxX[y*gw+x+1], vA1=vtxY[y*gw+x+1];
-        const vB0=vtxX[(maxY+1)*gw+x+1], vB1=vtxY[(maxY+1)*gw+x+1];
-        addTri(vA0,vA1,0, vB0,vB1,0, vB0,vB1,z1);
-        addTri(vA0,vA1,0, vB0,vB1,z1, vA0,vA1,z0);
-        y = maxY + 1;
+        const z1 = hv(x+1,maxY+1);
+        addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],z1);
+        addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],z1, vx[y*gw+x+1],vy[y*gw+x+1],z0);
+        y = maxY+1;
       }
     }
-
-    // FRONT side (top edge at row y, merge in X direction)
-    for (let y = 0; y < gh - 1; y++) {
+    // FRONT side (y-1 neighbor not ci)
+    for (let y = 0; y < gh-1; y++) {
       let x = 0;
-      while (x < gw - 1) {
-        if (getCellOwner(x, y) !== ci || getCellOwner(x, y-1) === ci) { x++; continue; }
-        const z0 = zAt(x, y);
+      while (x < gw-1) {
+        if (getCellOwner(x,y) !== ci || getCellOwner(x,y-1) === ci) { x++; continue; }
+        const z0 = hv(x,y);
         let maxX = x;
-        while (maxX + 1 < gw - 1) {
-          const next = maxX + 1;
-          if (getCellOwner(next, y) !== ci || getCellOwner(next, y-1) === ci) break;
-          if (zAt(next, y) !== z0 || zAt(next+1, y) !== z0) break;
+        while (maxX+1 < gw-1) {
+          const next = maxX+1;
+          if (getCellOwner(next,y) !== ci || getCellOwner(next,y-1) === ci) break;
+          if (hv(next,y) !== z0 || hv(next+1,y) !== z0) break;
           maxX = next;
         }
-        const z1 = zAt(maxX+1, y);
-        const vA0=vtxX[y*gw+x], vA1=vtxY[y*gw+x];
-        const vB0=vtxX[y*gw+maxX+1], vB1=vtxY[y*gw+maxX+1];
-        addTri(vA0,vA1,0, vB0,vB1,0, vB0,vB1,z1);
-        addTri(vA0,vA1,0, vB0,vB1,z1, vA0,vA1,z0);
-        x = maxX + 1;
+        const z1 = hv(maxX+1,y);
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],z1);
+        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],z1, vx[y*gw+x],vy[y*gw+x],z0);
+        x = maxX+1;
       }
     }
-
-    // BACK side (bottom edge at row y+1, merge in X direction)
-    for (let y = 0; y < gh - 1; y++) {
+    // BACK side (y+1 neighbor not ci)
+    for (let y = 0; y < gh-1; y++) {
       let x = 0;
-      while (x < gw - 1) {
-        if (getCellOwner(x, y) !== ci || getCellOwner(x, y+1) === ci) { x++; continue; }
-        const z0 = zAt(x, y+1);
+      while (x < gw-1) {
+        if (getCellOwner(x,y) !== ci || getCellOwner(x,y+1) === ci) { x++; continue; }
+        const z0 = hv(x,y+1);
         let maxX = x;
-        while (maxX + 1 < gw - 1) {
-          const next = maxX + 1;
-          if (getCellOwner(next, y) !== ci || getCellOwner(next, y+1) === ci) break;
-          if (zAt(next, y+1) !== z0 || zAt(next+1, y+1) !== z0) break;
+        while (maxX+1 < gw-1) {
+          const next = maxX+1;
+          if (getCellOwner(next,y) !== ci || getCellOwner(next,y+1) === ci) break;
+          if (hv(next,y+1) !== z0 || hv(next+1,y+1) !== z0) break;
           maxX = next;
         }
-        const z1 = zAt(maxX+1, y+1);
-        const vA0=vtxX[(y+1)*gw+x], vA1=vtxY[(y+1)*gw+x];
-        const vB0=vtxX[(y+1)*gw+maxX+1], vB1=vtxY[(y+1)*gw+maxX+1];
-        addTri(vA0,vA1,0, vB0,vB1,z1, vB0,vB1,0);
-        addTri(vA0,vA1,0, vA0,vA1,z0, vB0,vB1,z1);
-        x = maxX + 1;
+        const z1 = hv(maxX+1,y+1);
+        addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],z1, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],bottomZ);
+        addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+x],vy[(y+1)*gw+x],z0, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],z1);
+        x = maxX+1;
       }
     }
 
     if (triCount === 0) continue;
 
-    // Build final STL buffer now that we know the exact triangle count
     const bufSize = 84 + triCount * 50;
     if (bufSize > 500 * 1024 * 1024) {
-      throw new Error(`Per-color STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
+      throw new Error(`Per-color STL too large (~${(bufSize/1024/1024).toFixed(0)} MB) — lower the Resolution setting`);
     }
     const buf = new ArrayBuffer(bufSize);
     const view = new DataView(buf);
-
     const headerStr = `Color ${ci}: ${colorName}`;
     for (let i = 0; i < 80; i++) view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
     view.setUint32(80, triCount, true);
-
     let offset = 84;
     for (let t = 0; t < triCount; t++) {
       const base = t * 12;
-      for (let k = 0; k < 12; k++) { view.setFloat32(offset, triFloats[base + k], true); offset += 4; }
+      for (let k = 0; k < 12; k++) { view.setFloat32(offset, triFloats[base+k], true); offset += 4; }
       view.setUint16(offset, 0, true); offset += 2;
     }
-
     const safeName = colorName.replace(/[^a-zA-Z0-9]/g, '_');
     results.push({ name: `${fileName}_${ci}_${safeName}.stl`, data: new Uint8Array(buf) });
   }

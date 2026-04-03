@@ -182,11 +182,11 @@ export default function App() {
       const r = await post<{
         stlBuf: ArrayBuffer; tris: Float32Array; colorIndex: Uint8Array; palette: RGB[];
         BG_INDEX: number; gw: number; gh: number; modelW: number; modelH: number;
-        heights: Float32Array; dx: number; dy: number; mirrorX: boolean; triCount: number;
+        heights: Float32Array; vtxX: Float32Array; vtxY: Float32Array; dx: number; dy: number; mirrorX: boolean; triCount: number;
       }>({ type: 'generate', imgBuf, imgW: imgData.width, imgH: imgData.height, settings, manualPalette, hasAlpha, fileIsPng }, [imgBuf]);
       const blob = new Blob([r.stlBuf], { type: 'application/octet-stream' });
       setStlBlob(blob);
-      setMeshResult({ blob, triCount: r.triCount, tris: r.tris, colorIndex: r.colorIndex, palette: r.palette, BG_INDEX: r.BG_INDEX, gw: r.gw, gh: r.gh, modelW: r.modelW, modelH: r.modelH, heights: r.heights, dx: r.dx, dy: r.dy, mirrorX: r.mirrorX });
+      setMeshResult({ blob, triCount: r.triCount, tris: r.tris, colorIndex: r.colorIndex, palette: r.palette, BG_INDEX: r.BG_INDEX, gw: r.gw, gh: r.gh, modelW: r.modelW, modelH: r.modelH, heights: r.heights, vtxX: r.vtxX, vtxY: r.vtxY, dx: r.dx, dy: r.dy, mirrorX: r.mirrorX });
       setStatus(`Done! ${(r.stlBuf.byteLength / (1024 * 1024)).toFixed(2)} MB, ${(r.triCount / 1000).toFixed(1)}K triangles`, 'done');
     } catch (e: unknown) {
       setStatus(`Error: ${(e as Error).message}`, 'error');
