@@ -126,7 +126,6 @@ export function quantizeColors(
       const sx0 = Math.floor(x * scaleX), sx1 = Math.min(sw - 1, Math.floor((x + 1) * scaleX));
 
       if (useMajorityVoting && forcePalette && mvVotes) {
-        const AA_THRESH = 80 * 80 + 80 * 80 + 80 * 80;
         mvVotes.fill(0);
         const votes = mvVotes;
         let totalAlpha = 0;
@@ -143,7 +142,8 @@ export function quantizeColors(
               const d = dr * dr + dg * dg + db * db;
               if (d < bestD) { bestD = d; bestP = p; }
             }
-            if (bestD > AA_THRESH) continue;
+            // All pixels (including anti-aliased blends) vote for their nearest palette color.
+            // Blended boundary pixels are a minority in any cell, so pure pixels still dominate.
             votes[bestP]++;
           }
         }
@@ -283,17 +283,53 @@ export function quantizeColors(
   }
 
   const palette: RGB[] = clusters.map(c => [Math.round(c.r), Math.round(c.g), Math.round(c.b)]);
+
+  // Snap-majority-vote final assignment: each source pixel votes for its nearest palette color.
+  // This eliminates blended-average artifacts that the average-then-nearest approach creates
+  // at anti-aliased boundaries or JPEG-compressed edges.
   const colorIndex = new Uint8Array(count);
-  for (let i = 0; i < count; i++) {
-    if (bgMask && bgMask[i]) { colorIndex[i] = BG_INDEX; continue; }
-    const pr = colors[i * 3], pg = colors[i * 3 + 1], pb = colors[i * 3 + 2];
-    let bestD = Infinity, bestIdx = 0;
-    for (let p = 0; p < palette.length; p++) {
-      const dr = pr - palette[p][0], dg = pg - palette[p][1], db = pb - palette[p][2];
-      const d = dr * dr + dg * dg + db * db;
-      if (d < bestD) { bestD = d; bestIdx = p; }
+  const snapVotes = new Uint32Array(palette.length);
+  for (let y = 0; y < targetH; y++) {
+    const sy0 = Math.floor(y * scaleY), sy1 = Math.min(sh - 1, Math.floor((y + 1) * scaleY));
+    for (let x = 0; x < targetW; x++) {
+      const i = y * targetW + x;
+      if (bgMask && bgMask[i]) { colorIndex[i] = BG_INDEX; continue; }
+      const sx0 = Math.floor(x * scaleX), sx1 = Math.min(sw - 1, Math.floor((x + 1) * scaleX));
+      snapVotes.fill(0);
+      let totalV = 0;
+      for (let sy = sy0; sy <= sy1; sy++) {
+        for (let sx = sx0; sx <= sx1; sx++) {
+          const si = (sy * sw + sx) * 4;
+          if (pixels[si + 3] < 128) continue;
+          const pr = pixels[si], pg = pixels[si + 1], pb = pixels[si + 2];
+          let bestD = Infinity, bestP = 0;
+          for (let p = 0; p < palette.length; p++) {
+            const dr = pr - palette[p][0], dg = pg - palette[p][1], db = pb - palette[p][2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bestD) { bestD = d; bestP = p; }
+          }
+          snapVotes[bestP]++;
+          totalV++;
+        }
+      }
+      if (totalV === 0) {
+        // No opaque source pixels — fall back to averaged-cell nearest-color
+        const pr = colors[i * 3], pg = colors[i * 3 + 1], pb = colors[i * 3 + 2];
+        let bestD = Infinity, bestIdx = 0;
+        for (let p = 0; p < palette.length; p++) {
+          const dr = pr - palette[p][0], dg = pg - palette[p][1], db = pb - palette[p][2];
+          const d = dr * dr + dg * dg + db * db;
+          if (d < bestD) { bestD = d; bestIdx = p; }
+        }
+        colorIndex[i] = bestIdx;
+      } else {
+        let bestV = 0, bestC = 0;
+        for (let p = 0; p < palette.length; p++) {
+          if (snapVotes[p] > bestV) { bestV = snapVotes[p]; bestC = p; }
+        }
+        colorIndex[i] = bestC;
+      }
     }
-    colorIndex[i] = bestIdx;
   }
 
   return { colorIndex, palette, BG_INDEX };

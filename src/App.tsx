@@ -13,6 +13,25 @@ import { Preview3D } from './components/Preview3D';
 import { ZoomLens } from './components/ZoomLens';
 import { StatusBar } from './components/StatusBar';
 
+// Snap every pixel in-place to its nearest palette color.
+// Eliminates anti-aliasing blends so the pipeline only sees pure palette colors.
+function snapPixelsToNearestColor(pixels: Uint8ClampedArray, palette: RGB[]): void {
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (pixels[i + 3] < 128) continue;
+    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+    let bestD = Infinity, bestIdx = 0;
+    for (let p = 0; p < palette.length; p++) {
+      const dr = r - palette[p][0], dg = g - palette[p][1], db = b - palette[p][2];
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bestD) { bestD = d; bestIdx = p; }
+    }
+    pixels[i]     = palette[bestIdx][0];
+    pixels[i + 1] = palette[bestIdx][1];
+    pixels[i + 2] = palette[bestIdx][2];
+    pixels[i + 3] = 255;
+  }
+}
+
 export default function App() {
   const { settings, updateSetting } = useSettings();
   const post = useWorker();
@@ -69,7 +88,13 @@ export default function App() {
           const ctx = srcCanvas.getContext('2d')!;
           ctx.clearRect(0, 0, renderW, renderH);
           ctx.drawImage(img, 0, 0, renderW, renderH);
+
+          // Snap every pixel to its nearest SVG palette color before anything else.
+          // This eliminates anti-aliased blends at color boundaries so the worker
+          // only ever sees pure palette colors — no scattered fragment artifacts.
           const data = ctx.getImageData(0, 0, renderW, renderH);
+          snapPixelsToNearestColor(data.data, svgColors);
+          ctx.putImageData(data, 0, 0); // write snapped pixels back so the downsample uses them too
 
           // Downsample to ~512px for color counting — full-res isn't needed here
           const countW = Math.min(512, renderW);
