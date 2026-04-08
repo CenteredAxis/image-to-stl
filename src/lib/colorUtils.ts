@@ -154,3 +154,61 @@ export function sizeEstimate(
   const warn = mb > 300 ? ' ⚠️ may be slow' : '';
   return `~${mb.toFixed(0)} MB est. (${noMergeMB.toFixed(0)} MB without merging)${warn}`;
 }
+
+/**
+ * Reduces a palette to at most maxColors by iteratively merging the two
+ * closest colors (by Lab-space deltaE). Returns the merged palette and
+ * a mapping from old palette indices to new ones.
+ */
+export function mergePaletteToLimit(
+  palette: RGB[],
+  maxColors: number
+): { merged: RGB[]; mergeMap: number[] } {
+  if (palette.length <= maxColors) {
+    return { merged: [...palette], mergeMap: palette.map((_, i) => i) };
+  }
+
+  // Work with Lab values for perceptual merging
+  const labs = palette.map(c => rgbToLab(c[0], c[1], c[2]));
+  const active = new Set(palette.map((_, i) => i));
+  const parentMap = palette.map((_, i) => i); // tracks merge targets
+
+  while (active.size > maxColors) {
+    let bestDist = Infinity, bestA = -1, bestB = -1;
+    const indices = [...active];
+    for (let i = 0; i < indices.length; i++) {
+      for (let j = i + 1; j < indices.length; j++) {
+        const a = indices[i], b = indices[j];
+        const dL = labs[a][0] - labs[b][0];
+        const da = labs[a][1] - labs[b][1];
+        const db = labs[a][2] - labs[b][2];
+        const d = dL * dL + da * da + db * db;
+        if (d < bestDist) { bestDist = d; bestA = a; bestB = b; }
+      }
+    }
+    // Merge bestB into bestA (average RGB)
+    const ca = palette[bestA], cb = palette[bestB];
+    palette[bestA] = [
+      Math.round((ca[0] + cb[0]) / 2),
+      Math.round((ca[1] + cb[1]) / 2),
+      Math.round((ca[2] + cb[2]) / 2),
+    ];
+    labs[bestA] = rgbToLab(palette[bestA][0], palette[bestA][1], palette[bestA][2]);
+    active.delete(bestB);
+    // Update parent references
+    for (let i = 0; i < parentMap.length; i++) {
+      if (parentMap[i] === bestB) parentMap[i] = bestA;
+    }
+  }
+
+  const activeArr = [...active];
+  const indexRemap = new Map<number, number>();
+  const merged: RGB[] = [];
+  for (let i = 0; i < activeArr.length; i++) {
+    indexRemap.set(activeArr[i], i);
+    merged.push(palette[activeArr[i]]);
+  }
+  const mergeMap = parentMap.map(p => indexRemap.get(p) ?? 0);
+
+  return { merged, mergeMap };
+}

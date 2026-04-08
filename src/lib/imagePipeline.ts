@@ -641,6 +641,88 @@ export function blurDistanceField(
   }
 }
 
+/**
+ * Computes per-pixel feature width (in pixels) for adaptive chamfer.
+ * For each connected component, finds the max inscribed distance (from the
+ * already-computed boundary distance field) and returns 2 * that value for
+ * every pixel in the component.
+ */
+export function computeFeatureWidth(
+  colorIndex: Uint8Array,
+  dist: Float32Array,
+  w: number,
+  h: number,
+  BG_INDEX: number
+): Float32Array {
+  const n = w * h;
+  const componentId = new Int32Array(n).fill(-1);
+  const componentMaxDist: number[] = [];
+  let nextId = 0;
+
+  // Flood-fill to label connected components
+  for (let i = 0; i < n; i++) {
+    if (componentId[i] >= 0 || colorIndex[i] === BG_INDEX) continue;
+    const color = colorIndex[i];
+    const id = nextId++;
+    let maxD = 0;
+    const stack = [i];
+    componentId[i] = id;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      if (dist[p] > maxD) maxD = dist[p];
+      const px = p % w, py = (p - px) / w;
+      const neighbors = [
+        py > 0 ? p - w : -1,
+        py < h - 1 ? p + w : -1,
+        px > 0 ? p - 1 : -1,
+        px < w - 1 ? p + 1 : -1,
+      ];
+      for (const ni of neighbors) {
+        if (ni >= 0 && componentId[ni] < 0 && colorIndex[ni] === color) {
+          componentId[ni] = id;
+          stack.push(ni);
+        }
+      }
+    }
+    componentMaxDist.push(maxD);
+  }
+
+  // Assign feature width = 2 * component's max inscribed distance
+  const featureWidth = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    if (colorIndex[i] === BG_INDEX) {
+      featureWidth[i] = 0;
+    } else {
+      featureWidth[i] = 2 * componentMaxDist[componentId[i]];
+    }
+  }
+  return featureWidth;
+}
+
+/**
+ * Identifies pixels where the feature width is below a minimum threshold.
+ * Returns a bitmask and per-color warnings.
+ */
+export function findThinRegions(
+  colorIndex: Uint8Array,
+  featureWidth: Float32Array,
+  w: number,
+  h: number,
+  BG_INDEX: number,
+  minWidthPx: number
+): { thinMask: Uint8Array; thinCount: number } {
+  const n = w * h;
+  const thinMask = new Uint8Array(n);
+  let thinCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (colorIndex[i] !== BG_INDEX && featureWidth[i] > 0 && featureWidth[i] < minWidthPx) {
+      thinMask[i] = 1;
+      thinCount++;
+    }
+  }
+  return { thinMask, thinCount };
+}
+
 export function runPipeline(
   imgData: ImageData,
   maxWidth: number,
@@ -668,6 +750,7 @@ export function runPipeline(
 
   const dist = computeBoundaryDist(colorIndex, tw, th, chamferWidth);
   blurDistanceField(dist, colorIndex, tw, th, smoothing, BG_INDEX);
+  const featureWidth = computeFeatureWidth(colorIndex, dist, tw, th, BG_INDEX);
 
-  return { colorIndex, palette, dist, BG_INDEX, tw, th, bgMask };
+  return { colorIndex, palette, dist, featureWidth, BG_INDEX, tw, th, bgMask };
 }

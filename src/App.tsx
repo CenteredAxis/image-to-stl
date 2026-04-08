@@ -3,6 +3,9 @@ import type { RGB, PipelineResult, MeshResult, ZoomLensInfo, StatusState } from 
 import { useSettings } from './hooks/useSettings';
 import { useWorker } from './hooks/useWorker';
 import { parseSvgColors, consolidateSvgColors } from './lib/svgParser';
+import { findThinRegions, computeBoundaryDist, computeFeatureWidth } from './lib/imagePipeline';
+import { getMinWallThickness } from './lib/printerProfile';
+import { mergePaletteToLimit } from './lib/colorUtils';
 import { DropZone } from './components/DropZone';
 import { SourceImageCanvas } from './components/SourceImageCanvas';
 import { BoundaryCanvas } from './components/BoundaryCanvas';
@@ -12,6 +15,7 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { Preview3D } from './components/Preview3D';
 import { ZoomLens } from './components/ZoomLens';
 import { StatusBar } from './components/StatusBar';
+import { RegionColorPicker } from './components/RegionColorPicker';
 
 // Snap every pixel in-place to its nearest palette color.
 // Eliminates anti-aliasing blends so the pipeline only sees pure palette colors.
@@ -48,6 +52,9 @@ export default function App() {
   const [meshResult, setMeshResult] = useState<MeshResult | null>(null);
   const [stlBlob, setStlBlob] = useState<Blob | null>(null);
 
+  const [thinWallCount, setThinWallCount] = useState(0);
+  const [thinMask, setThinMask] = useState<Uint8Array | null>(null);
+  const [regionEdit, setRegionEdit] = useState<{ pixels: number[]; colorIdx: number } | null>(null);
   const [status, setStatusState] = useState<StatusState>({ message: '', variant: '' });
   const [isGenerating, setIsGenerating] = useState(false);
   const [zoomLens, setZoomLens] = useState<ZoomLensInfo>({
@@ -93,6 +100,13 @@ export default function App() {
           // This eliminates anti-aliased blends at color boundaries so the worker
           // only ever sees pure palette colors — no scattered fragment artifacts.
           const data = ctx.getImageData(0, 0, renderW, renderH);
+
+          // Check if the SVG actually has transparent regions before snapping
+          let svgHasAlpha = false;
+          for (let pi = 3; pi < data.data.length; pi += 4) {
+            if (data.data[pi] < 128) { svgHasAlpha = true; break; }
+          }
+
           snapPixelsToNearestColor(data.data, svgColors);
           ctx.putImageData(data, 0, 0); // write snapped pixels back so the downsample uses them too
 
@@ -106,7 +120,7 @@ export default function App() {
 
           const { palette: dominant, snappedCount } = consolidateSvgColors(svgColors, countData);
           setImgData(data);
-          setHasAlpha(true);
+          setHasAlpha(svgHasAlpha);
           setManualPalette(dominant.map(c => [c[0], c[1], c[2]]));
           updateSetting('paletteMode', 'pick');
 
@@ -149,6 +163,17 @@ export default function App() {
     img.src = URL.createObjectURL(file);
   }, [settings.maxWidth, updateSetting, setStatus]);
 
+  // ── Auto-compute resolution from detail size ────────────────────────────────
+  useEffect(() => {
+    const computed = Math.round(settings.modelWidth / settings.detailSize);
+    const clamped = Math.max(64, Math.min(4096, computed));
+    // Round to nearest 32 for consistency
+    const rounded = Math.round(clamped / 32) * 32;
+    if (rounded !== settings.maxWidth) {
+      updateSetting('maxWidth', rounded);
+    }
+  }, [settings.detailSize, settings.modelWidth, settings.maxWidth, updateSetting]);
+
   // ── Pipeline (debounced, runs in worker) ─────────────────────────────────────
   const pipelineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pipelineSeqRef = useRef(0);
@@ -163,7 +188,7 @@ export default function App() {
       const imgBuf = imgData.data.slice().buffer;
       try {
         const r = await post<{
-          colorIndex: Uint8Array; palette: RGB[]; dist: Float32Array;
+          colorIndex: Uint8Array; palette: RGB[]; dist: Float32Array; featureWidth: Float32Array;
           BG_INDEX: number; tw: number; th: number; bgMask?: Uint8Array; bgCount: number;
         }>({
           type: 'pipeline', imgBuf, imgW: imgData.width, imgH: imgData.height,
@@ -173,7 +198,7 @@ export default function App() {
           minRegion: settings.minRegion, isPick, manualPalette, hasAlpha, fileIsPng,
         }, [imgBuf]);
         if (pipelineSeqRef.current !== seq) return; // stale — newer request in flight
-        setPipelineResult({ colorIndex: r.colorIndex, palette: r.palette, dist: r.dist, BG_INDEX: r.BG_INDEX, tw: r.tw, th: r.th });
+        setPipelineResult({ colorIndex: r.colorIndex, palette: r.palette, dist: r.dist, featureWidth: r.featureWidth, BG_INDEX: r.BG_INDEX, tw: r.tw, th: r.th });
         setBgPercent(r.bgMask ? (r.bgCount / r.bgMask.length) * 100 : 0);
       } catch (e: unknown) {
         if (pipelineSeqRef.current !== seq) return;
@@ -183,6 +208,20 @@ export default function App() {
     }, 150);
     return () => { if (pipelineTimerRef.current) clearTimeout(pipelineTimerRef.current); };
   }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, setStatus, post]);
+
+  // ── Wall thickness validation ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!pipelineResult) { setThinWallCount(0); setThinMask(null); return; }
+    const pixelSizeMm = settings.modelWidth / settings.maxWidth;
+    const minWall = getMinWallThickness(settings.nozzleDiameter);
+    const minWidthPx = minWall / pixelSizeMm;
+    const { thinMask: mask, thinCount } = findThinRegions(
+      pipelineResult.colorIndex, pipelineResult.featureWidth,
+      pipelineResult.tw, pipelineResult.th, pipelineResult.BG_INDEX, minWidthPx
+    );
+    setThinWallCount(thinCount);
+    setThinMask(mask);
+  }, [pipelineResult, settings.modelWidth, settings.maxWidth, settings.nozzleDiameter]);
 
   // ── Color pick ───────────────────────────────────────────────────────────────
   const handleColorPick = useCallback((r: number, g: number, b: number) => {
@@ -196,6 +235,32 @@ export default function App() {
   const handleRemovePalette = useCallback((i: number) => {
     setManualPalette(prev => prev.filter((_, idx) => idx !== i));
   }, []);
+
+  // ── Region color editing ────────────────────────────────────────────────────
+  const handleRegionClick = useCallback((pixels: number[], currentColorIdx: number) => {
+    setRegionEdit({ pixels, colorIdx: currentColorIdx });
+  }, []);
+
+  const handleRegionReassign = useCallback((newColorIdx: number) => {
+    if (!pipelineResult || !regionEdit) return;
+    const { tw, th, BG_INDEX, palette, dist } = pipelineResult;
+    const newColorIndex = new Uint8Array(pipelineResult.colorIndex);
+    for (const px of regionEdit.pixels) newColorIndex[px] = newColorIdx;
+    // Recompute boundary distance and feature width for updated regions
+    const newDist = computeBoundaryDist(newColorIndex, tw, th, settings.chamferWidth);
+    const newFeatureWidth = computeFeatureWidth(newColorIndex, newDist, tw, th, BG_INDEX);
+    setPipelineResult({ colorIndex: newColorIndex, palette, dist: newDist, featureWidth: newFeatureWidth, BG_INDEX, tw, th });
+    setMeshResult(null);
+    setStlBlob(null);
+    setRegionEdit(null);
+  }, [pipelineResult, regionEdit, settings.chamferWidth]);
+
+  // ── AMS auto-merge ───────────────────────────────────────────────────────────
+  const handleAutoMerge = useCallback(() => {
+    if (settings.amsSlots <= 0 || manualPalette.length <= settings.amsSlots) return;
+    const { merged } = mergePaletteToLimit([...manualPalette], settings.amsSlots);
+    setManualPalette(merged);
+  }, [manualPalette, settings.amsSlots]);
 
   // ── Generate ─────────────────────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
@@ -228,6 +293,27 @@ export default function App() {
     a.click();
     URL.revokeObjectURL(a.href);
   }, [stlBlob, fileName]);
+
+  const handleDownload3MF = useCallback(async () => {
+    if (!imgData) return;
+    setStatus('Generating 3MF project...', 'working');
+    const imgBuf = imgData.data.slice().buffer;
+    try {
+      const r = await post<{ threemfBuf: ArrayBuffer }>(
+        { type: 'threemf', imgBuf, imgW: imgData.width, imgH: imgData.height, settings, manualPalette, hasAlpha, fileIsPng, fileName },
+        [imgBuf]
+      );
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([r.threemfBuf], { type: 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml' }));
+      a.download = `${fileName}.3mf`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setStatus('Done! 3MF project exported.', 'done');
+    } catch (e: unknown) {
+      setStatus(`Error: ${(e as Error).message}`, 'error');
+      console.error(e);
+    }
+  }, [imgData, settings, manualPalette, hasAlpha, fileIsPng, fileName, post, setStatus]);
 
   const handleDownloadBambu = useCallback(async () => {
     if (!imgData) return;
@@ -286,6 +372,8 @@ export default function App() {
             <BoundaryCanvas
               result={pipelineResult}
               highlightSmall={settings.highlightSmall}
+              thinMask={thinMask}
+              onRegionClick={handleRegionClick}
               onZoom={setZoomLens}
               onZoomHide={hideZoom}
             />
@@ -307,13 +395,16 @@ export default function App() {
         </div>
       )}
 
-      <FilamentSection palette={displayPalette} />
+      <FilamentSection palette={displayPalette} amsSlots={settings.amsSlots} />
 
       <SettingsPanel
         settings={settings}
         onChange={updateSetting}
         hasImage={!!imgData}
         aspectRatio={aspectRatio}
+        thinWallCount={thinWallCount}
+        paletteCount={displayPalette.length}
+        onAutoMerge={handleAutoMerge}
       />
 
       <Preview3D result={meshResult} />
@@ -340,11 +431,32 @@ export default function App() {
         >
           Download for Bambu (per-color STLs)
         </button>
+        <button
+          className="btn-secondary"
+          disabled={!imgData || isGenerating}
+          onClick={handleDownload3MF}
+        >
+          Download 3MF (Bambu project)
+        </button>
       </div>
 
       <StatusBar status={status} />
 
       <ZoomLens info={zoomLens} />
+
+      {regionEdit && pipelineResult && (
+        <RegionColorPicker
+          currentColor={pipelineResult.palette[regionEdit.colorIdx]}
+          palette={pipelineResult.palette.filter((_, i) => i !== pipelineResult.BG_INDEX)}
+          onReassign={(idx) => {
+            // Map filtered index back to original palette index (skipping BG_INDEX)
+            let origIdx = idx;
+            if (pipelineResult.BG_INDEX <= idx) origIdx = idx + 1;
+            handleRegionReassign(origIdx);
+          }}
+          onClose={() => setRegionEdit(null)}
+        />
+      )}
     </div>
   );
 }

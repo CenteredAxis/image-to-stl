@@ -12,6 +12,7 @@ export interface PipelineResult {
   colorIndex: Uint8Array;
   palette: RGB[];
   dist: Float32Array;
+  featureWidth: Float32Array;
   BG_INDEX: number;
   tw: number;
   th: number;
@@ -54,6 +55,14 @@ export interface Settings {
   faceDown: boolean;
   highlightSmall: boolean;
   paletteMode: 'pick' | 'auto';
+  nozzleDiameter: number;
+  layerHeight: number;
+  snapToLayer: boolean;
+  minFeatureRetention: number;
+  amsSlots: number;
+  fitClearance: number;
+  mergeSmallPieces: number;
+  detailSize: number;
 }
 
 export interface ImageState {

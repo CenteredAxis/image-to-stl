@@ -7,11 +7,13 @@ const LENS_SIZE = 140;
 interface Props {
   result: PipelineResult | null;
   highlightSmall: boolean;
+  thinMask?: Uint8Array | null;
+  onRegionClick?: (pixels: number[], currentColorIdx: number) => void;
   onZoom: (info: ZoomLensInfo) => void;
   onZoomHide: () => void;
 }
 
-export function BoundaryCanvas({ result, highlightSmall, onZoom, onZoomHide }: Props) {
+export function BoundaryCanvas({ result, highlightSmall, thinMask, onRegionClick, onZoom, onZoomHide }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -96,7 +98,68 @@ export function BoundaryCanvas({ result, highlightSmall, onZoom, onZoomHide }: P
         ctx.globalAlpha = 1.0;
       }
     }
-  }, [result, highlightSmall]);
+    // Thin wall overlay
+    if (thinMask) {
+      const thinOverlay = ctx.createImageData(tw, th);
+      let hasThin = false;
+      for (let i = 0; i < tw * th; i++) {
+        if (!thinMask[i]) continue;
+        hasThin = true;
+        const x = i % tw, y = (i - x) / tw;
+        const stripe = ((x + y) % 4) < 2;
+        thinOverlay.data[i * 4] = 255;
+        thinOverlay.data[i * 4 + 1] = stripe ? 165 : 0;
+        thinOverlay.data[i * 4 + 2] = 0;
+        thinOverlay.data[i * 4 + 3] = 160;
+      }
+      if (hasThin) {
+        const tmpC2 = document.createElement('canvas');
+        tmpC2.width = tw; tmpC2.height = th;
+        tmpC2.getContext('2d')!.putImageData(thinOverlay, 0, 0);
+        ctx.globalAlpha = 0.6;
+        ctx.drawImage(tmpC2, 0, 0);
+        ctx.globalAlpha = 1.0;
+      }
+    }
+  }, [result, highlightSmall, thinMask]);
+
+  const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!result || !canvasRef.current || !onRegionClick) return;
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const ix = Math.floor((e.clientX - rect.left) * scaleX);
+    const iy = Math.floor((e.clientY - rect.top) * scaleY);
+    const { colorIndex, BG_INDEX, tw, th } = result;
+    if (ix < 0 || ix >= tw || iy < 0 || iy >= th) return;
+    const startIdx = iy * tw + ix;
+    const color = colorIndex[startIdx];
+    if (color === BG_INDEX) return;
+
+    // Flood-fill to find the connected component
+    const visited = new Uint8Array(tw * th);
+    const pixels: number[] = [startIdx];
+    visited[startIdx] = 1;
+    let head = 0;
+    while (head < pixels.length) {
+      const idx = pixels[head++];
+      const cx = idx % tw, cy = (idx - cx) / tw;
+      const neighbors = [
+        cx > 0 ? idx - 1 : -1,
+        cx < tw - 1 ? idx + 1 : -1,
+        cy > 0 ? idx - tw : -1,
+        cy < th - 1 ? idx + tw : -1,
+      ];
+      for (const ni of neighbors) {
+        if (ni >= 0 && !visited[ni] && colorIndex[ni] === color) {
+          visited[ni] = 1;
+          pixels.push(ni);
+        }
+      }
+    }
+    onRegionClick(pixels, color);
+  }, [result, onRegionClick]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return;
@@ -132,7 +195,8 @@ export function BoundaryCanvas({ result, highlightSmall, onZoom, onZoomHide }: P
   return (
     <canvas
       ref={canvasRef}
-      style={{ width: '100%' }}
+      style={{ width: '100%', cursor: onRegionClick ? 'pointer' : undefined }}
+      onClick={handleClick}
       onMouseMove={handleMouseMove}
       onMouseLeave={onZoomHide}
     />

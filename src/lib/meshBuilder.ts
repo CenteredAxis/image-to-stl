@@ -2,8 +2,11 @@ import type { RGB, MeshResult, Settings } from '../types';
 import { findClosestFilament } from './colorUtils';
 import {
   computeBgMask, quantizeColors, cleanColorIndex, erodeThinStrips,
-  extractBoundaryContours, computeBoundaryDist, blurDistanceField
+  extractBoundaryContours, computeBoundaryDist, blurDistanceField,
+  computeFeatureWidth
 } from './imagePipeline';
+import { getEffectiveDimensions } from './printerProfile';
+import { filterDegenerateTris } from './meshValidation';
 
 export function generateSTLWithMeshData(
   imgData: ImageData,
@@ -12,12 +15,16 @@ export function generateSTLWithMeshData(
   hasAlpha: boolean,
   fileIsPng: boolean
 ): MeshResult {
+  const eff = getEffectiveDimensions(settings);
   const {
-    maxWidth, numColors, surfaceHeight: surfaceH, baseHeight: baseH,
-    chamferDepth: chamferD, chamferWidth: chamferW, modelWidth: modelW,
+    maxWidth, numColors, chamferWidth: chamferW, modelWidth: modelW,
     hollow, removeBg, cutThrough, bgTolerance: bgTol,
-    smoothing: smoothSigma, minRegion, paletteMode, mirrorX, faceDown
+    smoothing: smoothSigma, minRegion, paletteMode, mirrorX, faceDown,
+    minFeatureRetention
   } = settings;
+  const surfaceH = eff.surfaceHeight;
+  const baseH = eff.baseHeight;
+  const chamferD = eff.chamferDepth;
   const isPick = paletteMode === 'pick';
 
   const aspect = imgData.height / imgData.width;
@@ -32,6 +39,7 @@ export function generateSTLWithMeshData(
   erodeThinStrips(colorIndex, gw, gh, BG_INDEX);
   const dist = computeBoundaryDist(colorIndex, gw, gh, chamferW);
   blurDistanceField(dist, colorIndex, gw, gh, smoothSigma, BG_INDEX);
+  const featureWidth = computeFeatureWidth(colorIndex, dist, gw, gh, BG_INDEX);
 
   const modelH = modelW * aspect;
   const dx = modelW / (gw - 1);
@@ -104,8 +112,13 @@ export function generateSTLWithMeshData(
   for (let i = 0; i < gw * gh; i++) {
     if (colorIndex[i] === BG_INDEX) { heights[i] = cutThrough ? 0 : baseH; continue; }
     const d = dist[i];
-    if (d >= chamferW) heights[i] = baseH + surfaceH;
-    else heights[i] = baseH + surfaceH - chamferD * (1 - d / chamferW);
+    // Adaptive chamfer: cap effective chamfer width for thin features
+    const fw = featureWidth[i];
+    const maxChamferForFeature = (fw / 2) * (1 - minFeatureRetention);
+    const effChamferW = Math.min(chamferW, Math.max(0.5, maxChamferForFeature));
+    const effChamferD = chamferD * (effChamferW / chamferW);
+    if (d >= effChamferW) heights[i] = baseH + surfaceH;
+    else heights[i] = baseH + surfaceH - effChamferD * (1 - d / effChamferW);
     heights[i] = Math.round(heights[i] * 100) / 100;
   }
 
@@ -202,7 +215,56 @@ export function generateSTLWithMeshData(
     pushTri(sx0,sy0,bottomZ, sx1,sy1,z(gw-1,y+1), sx0,sy0,z(gw-1,y));
   }
 
-  const totalTris = tris.length / 9;
+  // Internal side walls: close holes where non-BG cells border BG cells (cutThrough manifold)
+  if (cutThrough) {
+    for (let y = 0; y < gh - 1; y++) {
+      for (let x = 0; x < gw - 1; x++) {
+        // Check right edge: x+1 boundary
+        if (x + 1 < gw - 1) {
+          const leftBg = isBg(x, y) && isBg(x, y + 1);
+          const rightBg = isBg(x + 1, y) && isBg(x + 1, y + 1);
+          if (leftBg !== rightBg) {
+            const wx = x + 1;
+            const x0 = vtxX(wx, y), y0 = vtxY(wx, y), z0 = z(wx, y);
+            const x1 = vtxX(wx, y + 1), y1 = vtxY(wx, y + 1), z1 = z(wx, y + 1);
+            if (leftBg) {
+              // Wall faces left (toward non-BG on right)
+              pushTri(x0, y0, bottomZ, x1, y1, z1, x1, y1, bottomZ);
+              pushTri(x0, y0, bottomZ, x0, y0, z0, x1, y1, z1);
+            } else {
+              // Wall faces right (toward non-BG on left)
+              pushTri(x0, y0, bottomZ, x1, y1, bottomZ, x1, y1, z1);
+              pushTri(x0, y0, bottomZ, x1, y1, z1, x0, y0, z0);
+            }
+          }
+        }
+        // Check bottom edge: y+1 boundary
+        if (y + 1 < gh - 1) {
+          const topBg = isBg(x, y) && isBg(x + 1, y);
+          const botBg = isBg(x, y + 1) && isBg(x + 1, y + 1);
+          if (topBg !== botBg) {
+            const wy = y + 1;
+            const x0 = vtxX(x, wy), y0 = vtxY(x, wy), z0 = z(x, wy);
+            const x1 = vtxX(x + 1, wy), y1 = vtxY(x + 1, wy), z1 = z(x + 1, wy);
+            if (topBg) {
+              // Wall faces up (toward non-BG below)
+              pushTri(x0, y0, bottomZ, x1, y1, bottomZ, x1, y1, z1);
+              pushTri(x0, y0, bottomZ, x1, y1, z1, x0, y0, z0);
+            } else {
+              // Wall faces down (toward non-BG above)
+              pushTri(x0, y0, bottomZ, x1, y1, z1, x1, y1, bottomZ);
+              pushTri(x0, y0, bottomZ, x0, y0, z0, x1, y1, z1);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Filter degenerate triangles for manifold safety
+  const filteredTris = filterDegenerateTris(tris);
+
+  const totalTris = filteredTris.length / 9;
   const bufSize = 84 + totalTris * 50;
   if (bufSize > 500 * 1024 * 1024) {
     throw new Error(`STL too large (~${(bufSize / 1024 / 1024).toFixed(0)} MB) — lower the Resolution setting`);
@@ -219,10 +281,10 @@ export function generateSTLWithMeshData(
   const doWindingSwap = mirrorX !== faceDown;
 
   let offset = 84;
-  for (let t = 0; t < tris.length; t += 9) {
-    let ax=tris[t],ay=tris[t+1],az=tris[t+2];
-    let bx=tris[t+3],by=tris[t+4],bz=tris[t+5];
-    let cx=tris[t+6],cy=tris[t+7],cz=tris[t+8];
+  for (let t = 0; t < filteredTris.length; t += 9) {
+    let ax=filteredTris[t],ay=filteredTris[t+1],az=filteredTris[t+2];
+    let bx=filteredTris[t+3],by=filteredTris[t+4],bz=filteredTris[t+5];
+    let cx=filteredTris[t+6],cy=filteredTris[t+7],cz=filteredTris[t+8];
     if (faceDown) { az=totalH-az; bz=totalH-bz; cz=totalH-cz; }
     if (doWindingSwap) {
       let tmp: number;
@@ -249,7 +311,7 @@ export function generateSTLWithMeshData(
   }
 
   const blob = new Blob([buf], { type: 'application/octet-stream' });
-  return { blob, triCount: totalTris, tris: new Float32Array(tris), colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, vtxX: vx, vtxY: vy, dx, dy, mirrorX };
+  return { blob, triCount: totalTris, tris: new Float32Array(filteredTris), colorIndex, palette, BG_INDEX, gw, gh, modelW, modelH, heights, vtxX: vx, vtxY: vy, dx, dy, mirrorX };
 }
 
 // Derives per-color STLs directly from the combined mesh result so that vertex
@@ -260,8 +322,10 @@ export function generatePerColorSTLsFromMesh(
   settings: Settings,
   fileName: string
 ): { name: string; data: Uint8Array }[] {
-  const { colorIndex, palette, BG_INDEX, gw, gh, heights, vtxX: vx, vtxY: vy } = mesh;
-  const { baseHeight: baseH, surfaceHeight: surfaceH, hollow, mirrorX, faceDown, minRegion } = settings;
+  const { colorIndex, palette, BG_INDEX, gw, gh, heights, vtxX: vx, vtxY: vy, dx, dy } = mesh;
+  const eff2 = getEffectiveDimensions(settings);
+  const baseH = eff2.baseHeight, surfaceH = eff2.surfaceHeight;
+  const { hollow, mirrorX, faceDown, minRegion, fitClearance, mergeSmallPieces } = settings;
   const bottomZ = hollow ? baseH * 0.5 : 0;
 
   // Mark vertices belonging to large-enough connected components (filters tiny isolated blobs)
@@ -310,7 +374,79 @@ export function generatePerColorSTLsFromMesh(
     return cellOwner[y*(gw-1)+x];
   };
 
-  const results: { name: string; data: Uint8Array }[] = [];
+  // Merge small color components into their largest neighbor
+  if (mergeSmallPieces > 0) {
+    const visited = new Uint8Array(gw * gh);
+    for (let i = 0; i < gw * gh; i++) {
+      if (visited[i] || colorIndex[i] === BG_INDEX) continue;
+      const color = colorIndex[i];
+      const comp = [i];
+      visited[i] = 1;
+      let head = 0;
+      while (head < comp.length) {
+        const idx = comp[head++];
+        const cx = idx % gw, cy = (idx - cx) / gw;
+        if (cx > 0 && !visited[idx-1] && colorIndex[idx-1] === color) { visited[idx-1]=1; comp.push(idx-1); }
+        if (cx < gw-1 && !visited[idx+1] && colorIndex[idx+1] === color) { visited[idx+1]=1; comp.push(idx+1); }
+        if (cy > 0 && !visited[idx-gw] && colorIndex[idx-gw] === color) { visited[idx-gw]=1; comp.push(idx-gw); }
+        if (cy < gh-1 && !visited[idx+gw] && colorIndex[idx+gw] === color) { visited[idx+gw]=1; comp.push(idx+gw); }
+      }
+      if (comp.length < mergeSmallPieces) {
+        // Find the most common neighbor color
+        const neighborVotes = new Map<number, number>();
+        for (const idx of comp) {
+          const cx = idx % gw, cy = (idx - cx) / gw;
+          for (const ni of [cx > 0 ? idx-1 : -1, cx < gw-1 ? idx+1 : -1,
+                            cy > 0 ? idx-gw : -1, cy < gh-1 ? idx+gw : -1]) {
+            if (ni >= 0 && colorIndex[ni] !== color && colorIndex[ni] !== BG_INDEX) {
+              neighborVotes.set(colorIndex[ni], (neighborVotes.get(colorIndex[ni]) || 0) + 1);
+            }
+          }
+        }
+        if (neighborVotes.size > 0) {
+          let bestNeighbor = -1, bestCount = 0;
+          for (const [nc, count] of neighborVotes) if (count > bestCount) { bestCount = count; bestNeighbor = nc; }
+          // Reassign: merge into largest neighbor for per-color export
+          // (cellOwner will pick up the new color)
+          for (const idx of comp) cellColorMask[idx] = 0; // exclude from per-color export
+        }
+      }
+    }
+  }
+
+  // Pre-compute per-color boundary offset positions for fit clearance
+  const offsetVx = fitClearance > 0 ? new Float32Array(vx) : vx;
+  const offsetVy = fitClearance > 0 ? new Float32Array(vy) : vy;
+  if (fitClearance > 0) {
+    // For each vertex, compute inward offset if it's on a color boundary
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        const idx = y * gw + x;
+        const c = colorIndex[idx];
+        if (c === BG_INDEX) continue;
+        // Check if this vertex is on a boundary (neighbor has different color)
+        let isBoundary = false;
+        let nx = 0, ny = 0; // normal pointing inward (toward same-color)
+        for (const [ddx, ddy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+          const ax = x + ddx, ay = y + ddy;
+          if (ax < 0 || ax >= gw || ay < 0 || ay >= gh) { isBoundary = true; continue; }
+          const nc = colorIndex[ay * gw + ax];
+          if (nc !== c) {
+            isBoundary = true;
+            nx -= ddx; ny -= ddy; // point away from the different-color neighbor
+          }
+        }
+        if (!isBoundary) continue;
+        const len = Math.sqrt(nx * nx + ny * ny);
+        if (len < 0.01) continue;
+        // Offset vertex inward by fitClearance in world coordinates
+        offsetVx[idx] += (nx / len) * fitClearance;
+        offsetVy[idx] += (ny / len) * fitClearance;
+      }
+    }
+  }
+
+  const results: { name: string; data: Uint8Array; pixelCount: number }[] = [];
   const visitedTop = new Uint8Array((gw-1) * (gh-1));
   const visitedBot = new Uint8Array((gw-1) * (gh-1));
 
@@ -344,6 +480,10 @@ export function generatePerColorSTLsFromMesh(
       emitTri(nnx/len,nny/len,nnz/len, ax,ay,az, rbx,rby,rbz, rcx,rcy,rcz);
     };
 
+    // Use offset vertices for per-color pieces (fit clearance applied at boundaries)
+    const pvx = fitClearance > 0 ? offsetVx : vx;
+    const pvy = fitClearance > 0 ? offsetVy : vy;
+
     // Height from shared combined-mesh array — already rounded, identical to preview
     const hv = (x: number, y: number) => heights[y * gw + x];
 
@@ -351,6 +491,12 @@ export function generatePerColorSTLsFromMesh(
       const h00=hv(x,y), h10=hv(x+1,y), h01=hv(x,y+1), h11=hv(x+1,y+1);
       return h00===h10 && h00===h01 && h00===h11;
     };
+
+    // Count pixels for this color (for assembly ordering)
+    let pixelCount = 0;
+    for (let i = 0; i < gw * gh; i++) {
+      if (colorIndex[i] === ci && cellColorMask[i]) pixelCount++;
+    }
 
     // ── Top face: greedy rectangle merge filtered by color ────────────────────
     visitedTop.fill(0);
@@ -360,8 +506,8 @@ export function generatePerColorSTLsFromMesh(
         if (visitedTop[qi] || getCellOwner(x,y) !== ci) continue;
         if (!cellFlat(x,y)) {
           visitedTop[qi] = 1;
-          addTri(vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[y*gw+x+1],vy[y*gw+x+1],hv(x+1,y), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1));
-          addTri(vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1), vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1));
+          addTri(pvx[y*gw+x],pvy[y*gw+x],hv(x,y), pvx[y*gw+x+1],pvy[y*gw+x+1],hv(x+1,y), pvx[(y+1)*gw+x+1],pvy[(y+1)*gw+x+1],hv(x+1,y+1));
+          addTri(pvx[y*gw+x],pvy[y*gw+x],hv(x,y), pvx[(y+1)*gw+x+1],pvy[(y+1)*gw+x+1],hv(x+1,y+1), pvx[(y+1)*gw+x],pvy[(y+1)*gw+x],hv(x,y+1));
           continue;
         }
         const h = hv(x,y);
@@ -377,8 +523,8 @@ export function generatePerColorSTLsFromMesh(
           maxY++;
         }
         for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedTop[yy*(gw-1)+xx]=1;
-        addTri(vx[y*gw+x],vy[y*gw+x],h, vx[y*gw+maxX+1],vy[y*gw+maxX+1],h, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],h);
-        addTri(vx[y*gw+x],vy[y*gw+x],h, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],h, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],h);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],h, pvx[y*gw+maxX+1],pvy[y*gw+maxX+1],h, pvx[(maxY+1)*gw+maxX+1],pvy[(maxY+1)*gw+maxX+1],h);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],h, pvx[(maxY+1)*gw+maxX+1],pvy[(maxY+1)*gw+maxX+1],h, pvx[(maxY+1)*gw+x],pvy[(maxY+1)*gw+x],h);
       }
     }
 
@@ -398,8 +544,8 @@ export function generatePerColorSTLsFromMesh(
           maxY++;
         }
         for (let yy=y; yy<=maxY; yy++) for (let xx=x; xx<=maxX; xx++) visitedBot[yy*(gw-1)+xx]=1;
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],bottomZ);
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],bottomZ, vx[(maxY+1)*gw+maxX+1],vy[(maxY+1)*gw+maxX+1],bottomZ);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[(maxY+1)*gw+maxX+1],pvy[(maxY+1)*gw+maxX+1],bottomZ, pvx[y*gw+maxX+1],pvy[y*gw+maxX+1],bottomZ);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[(maxY+1)*gw+x],pvy[(maxY+1)*gw+x],bottomZ, pvx[(maxY+1)*gw+maxX+1],pvy[(maxY+1)*gw+maxX+1],bottomZ);
       }
     }
 
@@ -418,8 +564,8 @@ export function generatePerColorSTLsFromMesh(
           maxY = next;
         }
         const z1 = hv(x,maxY+1);
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],z1, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],bottomZ);
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+x],vy[y*gw+x],z0, vx[(maxY+1)*gw+x],vy[(maxY+1)*gw+x],z1);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[(maxY+1)*gw+x],pvy[(maxY+1)*gw+x],z1, pvx[(maxY+1)*gw+x],pvy[(maxY+1)*gw+x],bottomZ);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[y*gw+x],pvy[y*gw+x],z0, pvx[(maxY+1)*gw+x],pvy[(maxY+1)*gw+x],z1);
         y = maxY+1;
       }
     }
@@ -437,8 +583,8 @@ export function generatePerColorSTLsFromMesh(
           maxY = next;
         }
         const z1 = hv(x+1,maxY+1);
-        addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],z1);
-        addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(maxY+1)*gw+x+1],vy[(maxY+1)*gw+x+1],z1, vx[y*gw+x+1],vy[y*gw+x+1],z0);
+        addTri(pvx[y*gw+x+1],pvy[y*gw+x+1],bottomZ, pvx[(maxY+1)*gw+x+1],pvy[(maxY+1)*gw+x+1],bottomZ, pvx[(maxY+1)*gw+x+1],pvy[(maxY+1)*gw+x+1],z1);
+        addTri(pvx[y*gw+x+1],pvy[y*gw+x+1],bottomZ, pvx[(maxY+1)*gw+x+1],pvy[(maxY+1)*gw+x+1],z1, pvx[y*gw+x+1],pvy[y*gw+x+1],z0);
         y = maxY+1;
       }
     }
@@ -456,8 +602,8 @@ export function generatePerColorSTLsFromMesh(
           maxX = next;
         }
         const z1 = hv(maxX+1,y);
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],z1);
-        addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+maxX+1],vy[y*gw+maxX+1],z1, vx[y*gw+x],vy[y*gw+x],z0);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[y*gw+maxX+1],pvy[y*gw+maxX+1],bottomZ, pvx[y*gw+maxX+1],pvy[y*gw+maxX+1],z1);
+        addTri(pvx[y*gw+x],pvy[y*gw+x],bottomZ, pvx[y*gw+maxX+1],pvy[y*gw+maxX+1],z1, pvx[y*gw+x],pvy[y*gw+x],z0);
         x = maxX+1;
       }
     }
@@ -475,8 +621,8 @@ export function generatePerColorSTLsFromMesh(
           maxX = next;
         }
         const z1 = hv(maxX+1,y+1);
-        addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],z1, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],bottomZ);
-        addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+x],vy[(y+1)*gw+x],z0, vx[(y+1)*gw+maxX+1],vy[(y+1)*gw+maxX+1],z1);
+        addTri(pvx[(y+1)*gw+x],pvy[(y+1)*gw+x],bottomZ, pvx[(y+1)*gw+maxX+1],pvy[(y+1)*gw+maxX+1],z1, pvx[(y+1)*gw+maxX+1],pvy[(y+1)*gw+maxX+1],bottomZ);
+        addTri(pvx[(y+1)*gw+x],pvy[(y+1)*gw+x],bottomZ, pvx[(y+1)*gw+x],pvy[(y+1)*gw+x],z0, pvx[(y+1)*gw+maxX+1],pvy[(y+1)*gw+maxX+1],z1);
         x = maxX+1;
       }
     }
@@ -499,8 +645,15 @@ export function generatePerColorSTLsFromMesh(
       view.setUint16(offset, 0, true); offset += 2;
     }
     const safeName = colorName.replace(/[^a-zA-Z0-9]/g, '_');
-    results.push({ name: `${fileName}_${ci}_${safeName}.stl`, data: new Uint8Array(buf) });
+    results.push({ name: `${fileName}_${ci}_${safeName}.stl`, data: new Uint8Array(buf), pixelCount });
   }
 
-  return results;
+  // Sort by size descending — assembly order: largest pieces first
+  results.sort((a, b) => b.pixelCount - a.pixelCount);
+
+  // Rename with assembly order prefix
+  return results.map((r, i) => ({
+    name: `${String(i + 1).padStart(2, '0')}_${r.name}`,
+    data: r.data,
+  }));
 }

@@ -1,6 +1,7 @@
 import { runPipeline } from './imagePipeline';
 import { generateSTLWithMeshData, generatePerColorSTLsFromMesh } from './meshBuilder';
 import { buildZip } from './zip';
+import { build3MF } from './threemf';
 import type { Settings, RGB } from '../types';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import ImageTracerRaw from 'imagetracerjs';
@@ -22,6 +23,11 @@ export type WorkerRequest =
     }
   | {
       type: 'bambu'; id: number;
+      imgBuf: ArrayBuffer; imgW: number; imgH: number;
+      settings: Settings; manualPalette: RGB[]; hasAlpha: boolean; fileIsPng: boolean; fileName: string;
+    }
+  | {
+      type: 'threemf'; id: number;
       imgBuf: ArrayBuffer; imgW: number; imgH: number;
       settings: Settings; manualPalette: RGB[]; hasAlpha: boolean; fileIsPng: boolean; fileName: string;
     };
@@ -101,10 +107,11 @@ function discoverPaletteViaVtracer(imgData: ImageData, numColors: number): RGB[]
                             bgTolerance, smoothing, minRegion, effectiveIsPick, effectivePalette, hasAlpha, fileIsPng);
       let bgCount = 0;
       if (r.bgMask) for (let i = 0; i < r.bgMask.length; i++) if (r.bgMask[i]) bgCount++;
-      const transfers: Transferable[] = [r.colorIndex.buffer, r.dist.buffer];
+      const transfers: Transferable[] = [r.colorIndex.buffer, r.dist.buffer, r.featureWidth.buffer];
       if (r.bgMask) transfers.push(r.bgMask.buffer);
       (self as unknown as Worker).postMessage(
         { type, id, colorIndex: r.colorIndex, palette: r.palette, dist: r.dist,
+          featureWidth: r.featureWidth,
           BG_INDEX: r.BG_INDEX, tw: r.tw, th: r.th, bgMask: r.bgMask, bgCount },
         transfers
       );
@@ -154,6 +161,25 @@ function discoverPaletteViaVtracer(imgData: ImageData, numColors: number): RGB[]
       const zip = buildZip(files);
       const zipBuf = await zip.arrayBuffer();
       (self as unknown as Worker).postMessage({ type, id, zipBuf, fileCount: files.length }, [zipBuf]);
+
+    } else if (type === 'threemf') {
+      const { imgBuf, imgW, imgH, settings, manualPalette, hasAlpha, fileIsPng, fileName } = e.data;
+      const imgData = makeImgData(imgBuf, imgW, imgH);
+
+      let effectivePalette = manualPalette;
+      let effectiveSettings = settings;
+      if (settings.paletteMode !== 'pick') {
+        const vtPalette = discoverPaletteViaVtracer(imgData, settings.numColors);
+        if (vtPalette) {
+          effectivePalette = vtPalette;
+          effectiveSettings = { ...settings, paletteMode: 'pick' };
+        }
+      }
+
+      const mesh = generateSTLWithMeshData(imgData, effectiveSettings, effectivePalette, hasAlpha, fileIsPng);
+      const threemf = build3MF(mesh, settings, fileName);
+      const threemfBuf = await threemf.arrayBuffer();
+      (self as unknown as Worker).postMessage({ type, id, threemfBuf }, [threemfBuf]);
     }
   } catch (err) {
     (self as unknown as Worker).postMessage({ type, id, error: (err as Error).message });

@@ -19,6 +19,14 @@ export const DEFAULT_SETTINGS: Settings = {
   faceDown: false,
   highlightSmall: true,
   paletteMode: 'pick',
+  nozzleDiameter: 0.4,
+  layerHeight: 0.20,
+  snapToLayer: true,
+  minFeatureRetention: 0.5,
+  amsSlots: 0,
+  fitClearance: 0.10,
+  mergeSmallPieces: 0,
+  detailSize: 0.4,
 };
 
 export function useSettings() {
