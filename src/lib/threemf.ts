@@ -13,10 +13,18 @@ interface ColorPiece {
 }
 
 /**
+ * Encode a string to UTF-8 bytes and push to a chunks array.
+ * Avoids building one giant string for the entire XML.
+ */
+const enc = new TextEncoder();
+function pushStr(chunks: Uint8Array[], s: string) {
+  chunks.push(enc.encode(s));
+}
+
+/**
  * Builds a Bambu-compatible 3MF file from the combined mesh result.
  * Each color becomes a separate object with material assignment.
- * Small pieces (below mergeSmallPieces threshold) are grouped with
- * their largest neighboring color for multi-color AMS printing.
+ * Uses chunked encoding to avoid string length limits on large meshes.
  */
 export function build3MF(
   mesh: MeshResult,
@@ -26,7 +34,7 @@ export function build3MF(
   const { colorIndex, palette, BG_INDEX, gw, gh, heights } = mesh;
   const eff = getEffectiveDimensions(settings);
   const baseH = eff.baseHeight, surfaceH = eff.surfaceHeight;
-  const { hollow, mirrorX, faceDown, fitClearance, mergeSmallPieces } = settings;
+  const { hollow, mirrorX, faceDown, fitClearance } = settings;
   const bottomZ = hollow ? baseH * 0.5 : 0;
   const totalH = baseH + surfaceH;
   const doWindingSwap = mirrorX !== faceDown;
@@ -57,81 +65,7 @@ export function build3MF(
     }
   }
 
-  // Connected component analysis for grouping
-  const componentLabel = new Int32Array(gw * gh).fill(-1);
-  const componentColor: number[] = [];
-  const componentSize: number[] = [];
-  let nextLabel = 0;
-  for (let i = 0; i < gw * gh; i++) {
-    if (componentLabel[i] >= 0 || colorIndex[i] === BG_INDEX) continue;
-    const color = colorIndex[i];
-    const label = nextLabel++;
-    const comp = [i];
-    componentLabel[i] = label;
-    let head = 0;
-    while (head < comp.length) {
-      const idx = comp[head++];
-      const cx = idx % gw, cy = (idx - cx) / gw;
-      for (const ni of [cx > 0 ? idx-1 : -1, cx < gw-1 ? idx+1 : -1,
-                        cy > 0 ? idx-gw : -1, cy < gh-1 ? idx+gw : -1]) {
-        if (ni >= 0 && componentLabel[ni] < 0 && colorIndex[ni] === color) {
-          componentLabel[ni] = label;
-          comp.push(ni);
-        }
-      }
-    }
-    componentColor.push(color);
-    componentSize.push(comp.length);
-  }
-
-  // Determine grouping: small components get grouped with their largest neighbor
-  // groupId maps each component label to a "print group" id
-  const groupId = new Int32Array(nextLabel);
-  let nextGroup = 0;
-  // First pass: assign groups to large components
-  const compGroupMap = new Map<number, number>(); // component label -> group
-  for (let l = 0; l < nextLabel; l++) {
-    if (componentSize[l] >= mergeSmallPieces || mergeSmallPieces === 0) {
-      const g = nextGroup++;
-      groupId[l] = g;
-      compGroupMap.set(l, g);
-    } else {
-      groupId[l] = -1; // unassigned
-    }
-  }
-
-  // Second pass: assign small components to their largest neighbor's group
-  if (mergeSmallPieces > 0) {
-    for (let l = 0; l < nextLabel; l++) {
-      if (groupId[l] >= 0) continue;
-      // Find the largest neighboring component
-      const neighborVotes = new Map<number, number>();
-      for (let i = 0; i < gw * gh; i++) {
-        if (componentLabel[i] !== l) continue;
-        const cx = i % gw, cy = (i - cx) / gw;
-        for (const ni of [cx > 0 ? i-1 : -1, cx < gw-1 ? i+1 : -1,
-                          cy > 0 ? i-gw : -1, cy < gh-1 ? i+gw : -1]) {
-          if (ni >= 0 && componentLabel[ni] !== l && componentLabel[ni] >= 0) {
-            const nl = componentLabel[ni];
-            neighborVotes.set(nl, (neighborVotes.get(nl) || 0) + 1);
-          }
-        }
-      }
-      let bestNeighbor = -1, bestCount = 0;
-      for (const [nl, count] of neighborVotes) {
-        if (count > bestCount) { bestCount = count; bestNeighbor = nl; }
-      }
-      if (bestNeighbor >= 0 && groupId[bestNeighbor] >= 0) {
-        groupId[l] = groupId[bestNeighbor];
-      } else {
-        // No large neighbor found, give it its own group
-        groupId[l] = nextGroup++;
-      }
-    }
-  }
-
-  // Build per-color meshes (using cell ownership like per-color STL)
-  const cellOwner = new Int16Array((gw-1) * (gh-1)).fill(-1);
+  // Build cell ownership (same as per-color STL)
   const cellColorMask = new Uint8Array(gw * gh);
   {
     const visited = new Uint8Array(gw * gh);
@@ -151,6 +85,8 @@ export function build3MF(
       if (comp.length >= Math.max(settings.minRegion, 10)) for (const idx of comp) cellColorMask[idx] = 1;
     }
   }
+
+  const cellOwner = new Int16Array((gw-1) * (gh-1)).fill(-1);
   for (let y = 0; y < gh-1; y++) {
     for (let x = 0; x < gw-1; x++) {
       const i00=y*gw+x, i10=y*gw+x+1, i01=(y+1)*gw+x, i11=(y+1)*gw+x+1;
@@ -167,7 +103,7 @@ export function build3MF(
     }
   }
 
-  // Build pieces - one per color
+  // Build per-color mesh pieces
   const pieces: ColorPiece[] = [];
   const hv = (x: number, y: number) => heights[y * gw + x];
 
@@ -178,7 +114,6 @@ export function build3MF(
     const tris: number[] = [];
 
     const addVert = (x: number, y: number, z: number): number => {
-      // Apply faceDown
       const fz = faceDown ? totalH - z : z;
       const key = `${x.toFixed(4)},${y.toFixed(4)},${fz.toFixed(4)}`;
       let idx = vertMap.get(key);
@@ -199,7 +134,7 @@ export function build3MF(
     let pixelCount = 0;
     for (let i = 0; i < gw * gh; i++) if (colorIndex[i] === ci && cellColorMask[i]) pixelCount++;
 
-    // Top faces
+    // Top + bottom + side faces (same as before)
     for (let y = 0; y < gh-1; y++) {
       for (let x = 0; x < gw-1; x++) {
         if (cellOwner[y*(gw-1)+x] !== ci) continue;
@@ -207,7 +142,6 @@ export function build3MF(
         addTri(vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1), vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1));
       }
     }
-    // Bottom faces
     for (let y = 0; y < gh-1; y++) {
       for (let x = 0; x < gw-1; x++) {
         if (cellOwner[y*(gw-1)+x] !== ci) continue;
@@ -215,27 +149,22 @@ export function build3MF(
         addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],bottomZ);
       }
     }
-    // Side walls (simplified - emit where this color borders a different owner)
     const getCO = (x: number, y: number) => (x < 0 || x >= gw-1 || y < 0 || y >= gh-1) ? -1 : cellOwner[y*(gw-1)+x];
     for (let y = 0; y < gh-1; y++) {
       for (let x = 0; x < gw-1; x++) {
         if (getCO(x,y) !== ci) continue;
-        // Left wall
         if (getCO(x-1,y) !== ci) {
           addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+x],vy[y*gw+x],hv(x,y), vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1));
           addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1), vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ);
         }
-        // Right wall
         if (getCO(x+1,y) !== ci) {
           addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1), vx[y*gw+x+1],vy[y*gw+x+1],hv(x+1,y));
           addTri(vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],bottomZ, vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1));
         }
-        // Front wall
         if (getCO(x,y-1) !== ci) {
           addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+x+1],vy[y*gw+x+1],hv(x+1,y), vx[y*gw+x],vy[y*gw+x],hv(x,y));
           addTri(vx[y*gw+x],vy[y*gw+x],bottomZ, vx[y*gw+x+1],vy[y*gw+x+1],bottomZ, vx[y*gw+x+1],vy[y*gw+x+1],hv(x+1,y));
         }
-        // Back wall
         if (getCO(x,y+1) !== ci) {
           addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+x],vy[(y+1)*gw+x],hv(x,y+1), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1));
           addTri(vx[(y+1)*gw+x],vy[(y+1)*gw+x],bottomZ, vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],hv(x+1,y+1), vx[(y+1)*gw+x+1],vy[(y+1)*gw+x+1],bottomZ);
@@ -248,40 +177,11 @@ export function build3MF(
     pieces.push({ colorIndex: ci, color: palette[ci], name, vertices: verts, triangles: tris, pixelCount });
   }
 
-  // Build 3MF XML
-  const materials = pieces.map((p, i) => {
-    const [r, g, b] = p.color;
-    const hex = `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
-    return `      <base name="${escapeXml(p.name)}" displaycolor="${hex}" />`;
-  }).join('\n');
+  // Build 3MF XML as chunked Uint8Array to avoid string length limits
+  const modelChunks: Uint8Array[] = [];
 
-  let objectsXml = '';
-  let buildXml = '';
-  for (let i = 0; i < pieces.length; i++) {
-    const p = pieces[i];
-    const objId = i + 2; // id=1 is basematerials
-    const vertXml = [];
-    for (let v = 0; v < p.vertices.length; v += 3) {
-      vertXml.push(`          <vertex x="${p.vertices[v].toFixed(4)}" y="${p.vertices[v+1].toFixed(4)}" z="${p.vertices[v+2].toFixed(4)}" />`);
-    }
-    const triXml = [];
-    for (let t = 0; t < p.triangles.length; t += 3) {
-      triXml.push(`          <triangle v1="${p.triangles[t]}" v2="${p.triangles[t+1]}" v3="${p.triangles[t+2]}" />`);
-    }
-    objectsXml += `    <object id="${objId}" type="model" pid="1" pindex="${i}">
-      <mesh>
-        <vertices>
-${vertXml.join('\n')}
-        </vertices>
-        <triangles>
-${triXml.join('\n')}
-        </triangles>
-      </mesh>
-    </object>\n`;
-    buildXml += `    <item objectid="${objId}" />\n`;
-  }
-
-  const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
+  // Header + materials
+  pushStr(modelChunks, `<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="en-US"
   xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
   xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">
@@ -289,32 +189,79 @@ ${triXml.join('\n')}
   <metadata name="Title">${escapeXml(fileName)}</metadata>
   <resources>
     <basematerials id="1">
-${materials}
-    </basematerials>
-${objectsXml}  </resources>
-  <build>
-${buildXml}  </build>
-</model>`;
+`);
+  for (let i = 0; i < pieces.length; i++) {
+    const [r, g, b] = pieces[i].color;
+    const hex = `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+    pushStr(modelChunks, `      <base name="${escapeXml(pieces[i].name)}" displaycolor="${hex}" />\n`);
+  }
+  pushStr(modelChunks, '    </basematerials>\n');
 
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8"?>
+  // Objects — write vertices and triangles in small batches
+  const BATCH = 5000;
+  for (let i = 0; i < pieces.length; i++) {
+    const p = pieces[i];
+    const objId = i + 2;
+    pushStr(modelChunks, `    <object id="${objId}" type="model" pid="1" pindex="${i}">\n      <mesh>\n        <vertices>\n`);
+
+    // Write vertices in batches
+    const vertCount = p.vertices.length / 3;
+    for (let start = 0; start < vertCount; start += BATCH) {
+      const end = Math.min(start + BATCH, vertCount);
+      let batch = '';
+      for (let v = start; v < end; v++) {
+        const vi = v * 3;
+        batch += `          <vertex x="${p.vertices[vi].toFixed(4)}" y="${p.vertices[vi+1].toFixed(4)}" z="${p.vertices[vi+2].toFixed(4)}" />\n`;
+      }
+      pushStr(modelChunks, batch);
+    }
+
+    pushStr(modelChunks, '        </vertices>\n        <triangles>\n');
+
+    // Write triangles in batches
+    const triCount = p.triangles.length / 3;
+    for (let start = 0; start < triCount; start += BATCH) {
+      const end = Math.min(start + BATCH, triCount);
+      let batch = '';
+      for (let t = start; t < end; t++) {
+        const ti = t * 3;
+        batch += `          <triangle v1="${p.triangles[ti]}" v2="${p.triangles[ti+1]}" v3="${p.triangles[ti+2]}" />\n`;
+      }
+      pushStr(modelChunks, batch);
+    }
+
+    pushStr(modelChunks, '        </triangles>\n      </mesh>\n    </object>\n');
+  }
+
+  pushStr(modelChunks, '  </resources>\n  <build>\n');
+  for (let i = 0; i < pieces.length; i++) {
+    pushStr(modelChunks, `    <item objectid="${i + 2}" />\n`);
+  }
+  pushStr(modelChunks, '  </build>\n</model>');
+
+  // Concatenate model chunks into single Uint8Array
+  let totalLen = 0;
+  for (const c of modelChunks) totalLen += c.length;
+  const modelData = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of modelChunks) { modelData.set(c, offset); offset += c.length; }
+
+  const contentTypes = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
-</Types>`;
+</Types>`);
 
-  const rels = `<?xml version="1.0" encoding="UTF-8"?>
+  const rels = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />
-</Relationships>`;
+</Relationships>`);
 
-  const enc = new TextEncoder();
-  const files = [
-    { name: '[Content_Types].xml', data: enc.encode(contentTypes) },
-    { name: '_rels/.rels', data: enc.encode(rels) },
-    { name: '3D/3dmodel.model', data: enc.encode(modelXml) },
-  ];
-
-  return buildZip(files);
+  return buildZip([
+    { name: '[Content_Types].xml', data: contentTypes },
+    { name: '_rels/.rels', data: rels },
+    { name: '3D/3dmodel.model', data: modelData },
+  ]);
 }
 
 function escapeXml(s: string): string {
