@@ -31,6 +31,24 @@ export function generateSTLWithMeshData(
   const gw = maxWidth;
   const gh = Math.max(2, Math.round(maxWidth * aspect));
 
+  // Snap pixels to palette to eliminate anti-aliasing blends (same as SVG path)
+  if (isPick && manualPalette.length > 0) {
+    const px = imgData.data;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 3] < 128) continue;
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      let bestD = Infinity, bestIdx = 0;
+      for (let p = 0; p < manualPalette.length; p++) {
+        const dr = r - manualPalette[p][0], dg = g - manualPalette[p][1], db = b - manualPalette[p][2];
+        const d = dr * dr + dg * dg + db * db;
+        if (d < bestD) { bestD = d; bestIdx = p; }
+      }
+      px[i] = manualPalette[bestIdx][0];
+      px[i + 1] = manualPalette[bestIdx][1];
+      px[i + 2] = manualPalette[bestIdx][2];
+    }
+  }
+
   const bgMask = removeBg ? computeBgMask(imgData, gw, gh, bgTol, hasAlpha, fileIsPng) : null;
   const fp = (isPick && manualPalette.length > 0) ? manualPalette : null;
   const { colorIndex, palette, BG_INDEX } = quantizeColors(imgData, gw, gh, numColors, bgMask, fp);

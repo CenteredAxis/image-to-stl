@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS: Settings = {
   fitClearance: 0.10,
   mergeSmallPieces: 0,
   detailSize: 0.4,
+  highlightThinWalls: false,
 };
 
 export function useSettings() {

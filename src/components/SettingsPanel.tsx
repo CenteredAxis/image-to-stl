@@ -151,12 +151,8 @@ export function SettingsPanel({ settings, onChange, hasImage, aspectRatio, thinW
           <label style={{ fontWeight: 600, fontSize: '0.85rem', color: '#4a9eff', marginBottom: 4 }}>Resolution & Palette</label>
         </div>
 
-        <Slider label="Detail Size (mm)" id="detailSize" min={0.1} max={2.0} step={0.05}
-          value={detailSize} onChange={v => onChange('detailSize', v)}
-          extra={<>
-            <span style={{ fontSize: '0.7rem', color: '#888' }}>{maxWidth} vertices ({(modelWidth / maxWidth).toFixed(2)}mm/px)</span>
-            {sizeEstimate()}
-          </>} />
+        <Slider label="Resolution (vertices)" id="maxWidth" min={64} max={4096} step={32}
+          value={maxWidth} onChange={v => onChange('maxWidth', v)} extra={sizeEstimate()} />
 
         <div className="control-group">
           <label>Palette Mode</label>

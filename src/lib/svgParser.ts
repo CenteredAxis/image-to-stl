@@ -106,5 +106,32 @@ export function consolidateSvgColors(
     }
   }
 
-  return { palette: dominant, snappedCount: artifacts.length };
+  // Merge perceptually similar dominant colors (e.g. multiple near-blacks → one black)
+  const mergeDist = 15 * 15 * 3; // RGB Euclidean² threshold (~15 per channel)
+  const merged: RGB[] = [];
+  const used = new Uint8Array(dominant.length);
+  for (let i = 0; i < dominant.length; i++) {
+    if (used[i]) continue;
+    let bestR = dominant[i][0], bestG = dominant[i][1], bestB = dominant[i][2];
+    // Keep the darkest/most saturated representative (most distinct)
+    for (let j = i + 1; j < dominant.length; j++) {
+      if (used[j]) continue;
+      const dr = dominant[i][0] - dominant[j][0];
+      const dg = dominant[i][1] - dominant[j][1];
+      const db = dominant[i][2] - dominant[j][2];
+      if (dr * dr + dg * dg + db * db < mergeDist) {
+        used[j] = 1;
+        // Pick the more extreme (darker or more saturated) of the two
+        const lumI = bestR * 0.299 + bestG * 0.587 + bestB * 0.114;
+        const lumJ = dominant[j][0] * 0.299 + dominant[j][1] * 0.587 + dominant[j][2] * 0.114;
+        if (lumJ < lumI) {
+          // j is darker — use it as the representative
+          bestR = dominant[j][0]; bestG = dominant[j][1]; bestB = dominant[j][2];
+        }
+      }
+    }
+    merged.push([bestR, bestG, bestB]);
+  }
+
+  return { palette: merged, snappedCount: artifacts.length + (dominant.length - merged.length) };
 }

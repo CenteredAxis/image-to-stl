@@ -63,6 +63,7 @@ export interface Settings {
   fitClearance: number;
   mergeSmallPieces: number;
   detailSize: number;
+  highlightThinWalls: boolean;
 }
 
 export interface ImageState {

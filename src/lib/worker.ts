@@ -103,6 +103,25 @@ function discoverPaletteViaVtracer(imgData: ImageData, numColors: number): RGB[]
         if (vtPalette) { effectivePalette = vtPalette; effectiveIsPick = true; }
       }
 
+      // Snap pixels to the palette to eliminate anti-aliasing blends at boundaries.
+      // This is the same technique used for SVGs — gives clean region edges for any image.
+      if (effectiveIsPick && effectivePalette.length > 0) {
+        const px = imgData.data;
+        for (let i = 0; i < px.length; i += 4) {
+          if (px[i + 3] < 128) continue;
+          const r2 = px[i], g = px[i + 1], b = px[i + 2];
+          let bestD = Infinity, bestIdx = 0;
+          for (let p = 0; p < effectivePalette.length; p++) {
+            const dr = r2 - effectivePalette[p][0], dg = g - effectivePalette[p][1], db = b - effectivePalette[p][2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bestD) { bestD = d; bestIdx = p; }
+          }
+          px[i] = effectivePalette[bestIdx][0];
+          px[i + 1] = effectivePalette[bestIdx][1];
+          px[i + 2] = effectivePalette[bestIdx][2];
+        }
+      }
+
       const r = runPipeline(imgData, maxWidth, numColors, chamferWidth, removeBg,
                             bgTolerance, smoothing, minRegion, effectiveIsPick, effectivePalette, hasAlpha, fileIsPng);
       let bgCount = 0;

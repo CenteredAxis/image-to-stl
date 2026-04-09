@@ -52,6 +52,8 @@ export default function App() {
   const [meshResult, setMeshResult] = useState<MeshResult | null>(null);
   const [stlBlob, setStlBlob] = useState<Blob | null>(null);
 
+  const [svgPreview, setSvgPreview] = useState<ImageData | null>(null);
+  const [svgRawData, setSvgRawData] = useState<ImageData | null>(null);
   const [thinWallCount, setThinWallCount] = useState(0);
   const [thinMask, setThinMask] = useState<Uint8Array | null>(null);
   const [regionEdit, setRegionEdit] = useState<{ pixels: number[]; colorIdx: number } | null>(null);
@@ -77,6 +79,7 @@ export default function App() {
     setManualPalette([]);
     setMeshResult(null);
     setStlBlob(null);
+    if (!isSvg) { setSvgPreview(null); setSvgRawData(null); }
 
     if (isSvg) {
       const reader = new FileReader();
@@ -87,8 +90,9 @@ export default function App() {
         const img = new Image();
         img.onload = () => {
           const meshMax = settings.maxWidth;
-          // 2x oversample is enough for majority-voting in quantizeColors (scaleX >= 2)
-          const renderW = Math.min(2048, Math.max(meshMax * 2, img.width || meshMax * 2));
+          // Render at least 2x the mesh resolution for clean majority-voting,
+          // and never below the mesh resolution to avoid upsampling artifacts
+          const renderW = Math.min(8192, Math.max(meshMax * 2, img.width || meshMax * 2));
           const renderH = img.height ? Math.round(renderW * (img.height / img.width)) : renderW;
           const srcCanvas = document.createElement('canvas');
           srcCanvas.width = renderW; srcCanvas.height = renderH;
@@ -107,6 +111,9 @@ export default function App() {
             if (data.data[pi] < 128) { svgHasAlpha = true; break; }
           }
 
+          // Save raw (un-snapped) pixels so we can re-snap when palette changes
+          setSvgRawData(new ImageData(new Uint8ClampedArray(data.data), renderW, renderH));
+
           snapPixelsToNearestColor(data.data, svgColors);
           ctx.putImageData(data, 0, 0); // write snapped pixels back so the downsample uses them too
 
@@ -119,6 +126,8 @@ export default function App() {
           const countData = countCanvas.getContext('2d')!.getImageData(0, 0, countW, countH);
 
           const { palette: dominant, snappedCount } = consolidateSvgColors(svgColors, countData);
+          // Store the high-res snapped image for vector-quality boundary preview
+          setSvgPreview(new ImageData(new Uint8ClampedArray(data.data), renderW, renderH));
           setImgData(data);
           setHasAlpha(svgHasAlpha);
           setManualPalette(dominant.map(c => [c[0], c[1], c[2]]));
@@ -163,16 +172,13 @@ export default function App() {
     img.src = URL.createObjectURL(file);
   }, [settings.maxWidth, updateSetting, setStatus]);
 
-  // ── Auto-compute resolution from detail size ────────────────────────────────
+  // ── Re-snap SVG preview when palette changes ────────────────────────────────
   useEffect(() => {
-    const computed = Math.round(settings.modelWidth / settings.detailSize);
-    const clamped = Math.max(64, Math.min(4096, computed));
-    // Round to nearest 32 for consistency
-    const rounded = Math.round(clamped / 32) * 32;
-    if (rounded !== settings.maxWidth) {
-      updateSetting('maxWidth', rounded);
-    }
-  }, [settings.detailSize, settings.modelWidth, settings.maxWidth, updateSetting]);
+    if (!svgRawData || manualPalette.length === 0) return;
+    const copy = new ImageData(new Uint8ClampedArray(svgRawData.data), svgRawData.width, svgRawData.height);
+    snapPixelsToNearestColor(copy.data, manualPalette);
+    setSvgPreview(copy);
+  }, [svgRawData, manualPalette]);
 
   // ── Pipeline (debounced, runs in worker) ─────────────────────────────────────
   const pipelineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -372,7 +378,8 @@ export default function App() {
             <BoundaryCanvas
               result={pipelineResult}
               highlightSmall={settings.highlightSmall}
-              thinMask={thinMask}
+              thinMask={settings.highlightThinWalls ? thinMask : null}
+              svgPreview={svgPreview}
               onRegionClick={handleRegionClick}
               onZoom={setZoomLens}
               onZoomHide={hideZoom}
@@ -384,6 +391,14 @@ export default function App() {
                 onChange={e => updateSetting('highlightSmall', e.target.checked)}
               />
               Highlight non-contiguous regions
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, fontSize: '0.8rem', color: '#aaa', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.highlightThinWalls}
+                onChange={e => updateSetting('highlightThinWalls', e.target.checked)}
+              />
+              Highlight thin walls (&lt;{(settings.nozzleDiameter * 1.5).toFixed(1)}mm)
             </label>
             <ColorSwatches
               palette={displayPalette}
