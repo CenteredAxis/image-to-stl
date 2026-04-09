@@ -180,12 +180,14 @@ export function build3MF(
   // Build 3MF XML as chunked Uint8Array to avoid string length limits
   const modelChunks: Uint8Array[] = [];
 
-  // Header + materials
+  // Header + materials (Bambu Studio compatible namespaces)
   pushStr(modelChunks, `<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="en-US"
   xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
-  xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">
-  <metadata name="Application">Image-to-STL</metadata>
+  xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+  xmlns:BambuStudio="http://schemas.bambulab.com/package/2021">
+  <metadata name="Application">BambuStudio</metadata>
+  <metadata name="BambuStudio:3mfVersion">1</metadata>
   <metadata name="Title">${escapeXml(fileName)}</metadata>
   <resources>
     <basematerials id="1">
@@ -246,10 +248,31 @@ export function build3MF(
   let offset = 0;
   for (const c of modelChunks) { modelData.set(c, offset); offset += c.length; }
 
+  // Bambu model_settings.config — per-object settings with extruder assignments
+  const modelSettingsChunks: Uint8Array[] = [];
+  pushStr(modelSettingsChunks, `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n`);
+  for (let i = 0; i < pieces.length; i++) {
+    const objId = i + 2;
+    // extruder is 1-indexed in Bambu Studio
+    pushStr(modelSettingsChunks, `  <object id="${objId}">\n    <metadata key="extruder" value="${i + 1}" />\n    <metadata key="name" value="${escapeXml(pieces[i].name)}" />\n  </object>\n`);
+  }
+  pushStr(modelSettingsChunks, `</config>`);
+  let msLen = 0;
+  for (const c of modelSettingsChunks) msLen += c.length;
+  const modelSettingsData = new Uint8Array(msLen);
+  let msOff = 0;
+  for (const c of modelSettingsChunks) { modelSettingsData.set(c, msOff); msOff += c.length; }
+
+  // Bambu plate config — tells Bambu Studio which objects are on plate 1
+  const plateObjects = pieces.map((_, i) => `{"id":${i + 2},"extruder":${i + 1}}`).join(',');
+  const plateConfig = enc.encode(`[{"plate_index":0,"objects":[${plateObjects}]}]`);
+
   const contentTypes = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
+  <Default Extension="config" ContentType="text/xml" />
+  <Default Extension="json" ContentType="application/json" />
 </Types>`);
 
   const rels = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
@@ -261,6 +284,8 @@ export function build3MF(
     { name: '[Content_Types].xml', data: contentTypes },
     { name: '_rels/.rels', data: rels },
     { name: '3D/3dmodel.model', data: modelData },
+    { name: 'Metadata/model_settings.config', data: modelSettingsData },
+    { name: 'Metadata/plate_1.json', data: plateConfig },
   ]);
 }
 
