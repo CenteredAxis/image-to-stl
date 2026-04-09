@@ -151,7 +151,7 @@ export function SettingsPanel({ settings, onChange, hasImage, aspectRatio, thinW
           <label style={{ fontWeight: 600, fontSize: '0.85rem', color: '#4a9eff', marginBottom: 4 }}>Resolution & Palette</label>
         </div>
 
-        <Slider label="Resolution (vertices)" id="maxWidth" min={64} max={4096} step={32}
+        <Slider label="Resolution (vertices)" id="maxWidth" min={64} max={2048} step={32}
           value={maxWidth} onChange={v => onChange('maxWidth', v)} extra={sizeEstimate()} />
 
         <div className="control-group">

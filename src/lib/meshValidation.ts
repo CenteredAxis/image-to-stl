@@ -5,23 +5,27 @@
  */
 export function filterDegenerateTris(tris: number[]): number[] {
   const EPSILON = 1e-10;
-  const out: number[] = [];
+  let writeIdx = 0;
   for (let t = 0; t < tris.length; t += 9) {
     const ax = tris[t], ay = tris[t + 1], az = tris[t + 2];
     const bx = tris[t + 3], by = tris[t + 4], bz = tris[t + 5];
     const cx = tris[t + 6], cy = tris[t + 7], cz = tris[t + 8];
-    // Cross product magnitude = 2 * triangle area
     const ux = bx - ax, uy = by - ay, uz = bz - az;
     const vx = cx - ax, vy = cy - ay, vz = cz - az;
     const nx = uy * vz - uz * vy;
     const ny = uz * vx - ux * vz;
     const nz = ux * vy - uy * vx;
-    const area2 = nx * nx + ny * ny + nz * nz;
-    if (area2 > EPSILON) {
-      out.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+    if (nx * nx + ny * ny + nz * nz > EPSILON) {
+      if (writeIdx !== t) {
+        tris[writeIdx] = ax; tris[writeIdx+1] = ay; tris[writeIdx+2] = az;
+        tris[writeIdx+3] = bx; tris[writeIdx+4] = by; tris[writeIdx+5] = bz;
+        tris[writeIdx+6] = cx; tris[writeIdx+7] = cy; tris[writeIdx+8] = cz;
+      }
+      writeIdx += 9;
     }
   }
-  return out;
+  tris.length = writeIdx;
+  return tris;
 }
 
 /**
