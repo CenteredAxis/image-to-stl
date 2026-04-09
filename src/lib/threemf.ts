@@ -20,6 +20,14 @@ const enc = new TextEncoder();
 function pushStr(chunks: Uint8Array[], s: string) {
   chunks.push(enc.encode(s));
 }
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  let len = 0;
+  for (const c of chunks) len += c.length;
+  const out = new Uint8Array(len);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
 
 /**
  * Builds a Bambu-compatible 3MF file from the combined mesh result.
@@ -242,37 +250,43 @@ export function build3MF(
   pushStr(modelChunks, '  </build>\n</model>');
 
   // Concatenate model chunks into single Uint8Array
-  let totalLen = 0;
-  for (const c of modelChunks) totalLen += c.length;
-  const modelData = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const c of modelChunks) { modelData.set(c, offset); offset += c.length; }
+  const modelData = concatChunks(modelChunks);
 
   // Bambu model_settings.config — per-object settings with extruder assignments
   const modelSettingsChunks: Uint8Array[] = [];
   pushStr(modelSettingsChunks, `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n`);
   for (let i = 0; i < pieces.length; i++) {
     const objId = i + 2;
-    // extruder is 1-indexed in Bambu Studio
-    pushStr(modelSettingsChunks, `  <object id="${objId}">\n    <metadata key="extruder" value="${i + 1}" />\n    <metadata key="name" value="${escapeXml(pieces[i].name)}" />\n  </object>\n`);
+    pushStr(modelSettingsChunks, `  <object id="${objId}">\n`);
+    pushStr(modelSettingsChunks, `    <metadata key="name" value="${escapeXml(pieces[i].name)}" />\n`);
+    pushStr(modelSettingsChunks, `    <part id="${objId}" subtype="normal_part">\n`);
+    pushStr(modelSettingsChunks, `      <metadata key="name" value="${escapeXml(pieces[i].name)}" />\n`);
+    pushStr(modelSettingsChunks, `      <metadata key="extruder" value="${(i % 16) + 1}" />\n`);
+    pushStr(modelSettingsChunks, `    </part>\n`);
+    pushStr(modelSettingsChunks, `  </object>\n`);
   }
+  // Plate config within model_settings
+  pushStr(modelSettingsChunks, `  <plate>\n`);
+  pushStr(modelSettingsChunks, `    <metadata key="plater_id" value="1" />\n`);
+  pushStr(modelSettingsChunks, `    <metadata key="plater_name" value="" />\n`);
+  for (let i = 0; i < pieces.length; i++) {
+    pushStr(modelSettingsChunks, `    <metadata key="instance" value="${i + 2} 0" />\n`);
+  }
+  pushStr(modelSettingsChunks, `  </plate>\n`);
   pushStr(modelSettingsChunks, `</config>`);
-  let msLen = 0;
-  for (const c of modelSettingsChunks) msLen += c.length;
-  const modelSettingsData = new Uint8Array(msLen);
-  let msOff = 0;
-  for (const c of modelSettingsChunks) { modelSettingsData.set(c, msOff); msOff += c.length; }
+  const modelSettingsData = concatChunks(modelSettingsChunks);
 
-  // Bambu plate config — tells Bambu Studio which objects are on plate 1
-  const plateObjects = pieces.map((_, i) => `{"id":${i + 2},"extruder":${i + 1}}`).join(',');
-  const plateConfig = enc.encode(`[{"plate_index":0,"objects":[${plateObjects}]}]`);
+  // Bambu project_settings.config — minimal but required for native detection
+  const projectSettings = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>\n<config>\n</config>`);
+
+  // Bambu slice_info.config — empty but expected
+  const sliceInfo = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>\n<config>\n</config>`);
 
   const contentTypes = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
   <Default Extension="config" ContentType="text/xml" />
-  <Default Extension="json" ContentType="application/json" />
 </Types>`);
 
   const rels = enc.encode(`<?xml version="1.0" encoding="UTF-8"?>
@@ -285,7 +299,8 @@ export function build3MF(
     { name: '_rels/.rels', data: rels },
     { name: '3D/3dmodel.model', data: modelData },
     { name: 'Metadata/model_settings.config', data: modelSettingsData },
-    { name: 'Metadata/plate_1.json', data: plateConfig },
+    { name: 'Metadata/project_settings.config', data: projectSettings },
+    { name: 'Metadata/slice_info.config', data: sliceInfo },
   ]);
 }
 
